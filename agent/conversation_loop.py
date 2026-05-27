@@ -2756,6 +2756,20 @@ def run_conversation(
                 # provider/network failure (malformed response body,
                 # truncated stream, routing layer corruption), not a
                 # local programming bug, and should be retried (#14782).
+                # The Codex Responses SDK can raise
+                # ``TypeError("'NoneType' object is not iterable")`` when the
+                # backend returns ``response.output=None`` and the stream
+                # fallback also fails to backfill.  ``codex_runtime`` already
+                # has a recovery path for the in-stream case, but the
+                # create(stream=True) fallback can re-trip the same SDK bug
+                # and let the TypeError escape.  That's a transient SDK parse
+                # failure, not a local programming bug — treat it as
+                # retryable so the failover chain gets a chance.
+                _sdk_null_output_typeerror = (
+                    isinstance(api_error, TypeError)
+                    and "NoneType" in str(api_error)
+                    and "not iterable" in str(api_error)
+                )
                 is_local_validation_error = (
                     isinstance(api_error, (ValueError, TypeError))
                     and not isinstance(
@@ -2769,6 +2783,7 @@ def run_conversation(
                     # ssl.SSLError explicitly so the error classifier's
                     # retryable=True mapping takes effect instead.
                     and not isinstance(api_error, ssl.SSLError)
+                    and not _sdk_null_output_typeerror
                 )
                 is_client_error = (
                     is_local_validation_error
