@@ -811,7 +811,45 @@ class _CodexCompletionsAdapter:
                     elif "function_call" in _etype:
                         has_function_calls = True
                 _check_cancelled()
-                final = stream.get_final_response()
+                try:
+                    final = stream.get_final_response()
+                except TypeError as _final_exc:
+                    # OpenAI Responses SDK trips on ``response.output=None``
+                    # during get_final_response() parsing — the same bug
+                    # ``codex_runtime._responses_null_output_iterable_error``
+                    # handles for the main agent.  Recover by synthesizing a
+                    # response from the items/deltas we already streamed.
+                    _msg = str(_final_exc)
+                    if not ("NoneType" in _msg and "not iterable" in _msg):
+                        raise
+                    if collected_output_items:
+                        final = SimpleNamespace(
+                            output=list(collected_output_items),
+                            usage=None,
+                            status="completed",
+                        )
+                        logger.debug(
+                            "Codex auxiliary: recovered from SDK null-output "
+                            "TypeError using %d streamed items",
+                            len(collected_output_items),
+                        )
+                    elif collected_text_deltas and not has_function_calls:
+                        assembled = "".join(collected_text_deltas)
+                        final = SimpleNamespace(
+                            output=[SimpleNamespace(
+                                type="message", role="assistant", status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )],
+                            usage=None,
+                            status="completed",
+                        )
+                        logger.debug(
+                            "Codex auxiliary: recovered from SDK null-output "
+                            "TypeError by synthesizing %d chars from %d deltas",
+                            len(assembled), len(collected_text_deltas),
+                        )
+                    else:
+                        raise
 
             # Backfill empty output from collected stream events
             _output = getattr(final, "output", None)
