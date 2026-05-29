@@ -1,6 +1,6 @@
 ---
 name: ardmag-image-generation
-description: Produce hero / social images for ARDmag blog articles by detecting the real products mentioned in the article, mapping them to real product assets under backend/static/images/<handle>/, and assembling an organic workshop-scene prompt. Refuses to reuse generic category assets when specific products are named, refuses collage/cutout/floating-product framing, and emits a cache-busting semantic filename plus a production-validation checklist.
+description: Produce hero / social images for ARDmag blog articles by detecting the real products mentioned in the article, mapping them to real product assets under backend/static/images/<handle>/, attaching those real packshots to Codex/imagegen as image references, and assembling an organic workshop-scene prompt. Refuses to reuse generic category assets when specific products are named, refuses to generate without real packshots attached (which makes the model invent packaging), refuses collage/cutout/floating-product framing, and emits a cache-busting semantic filename plus a production-validation checklist.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -56,21 +56,31 @@ python "$SKILL_DIR/scripts/ardmag_brief.py" build-brief \
 The brief is JSON with:
 
 - `brand` — inferred brand (`delta-research`, `tenax`, `mixed`, or `none`)
-- `products` — list of `{name, slug, asset_dir, sample_image, in_catalog}` for every product mentioned in the article
+- `products` — list of `{name, slug, asset_dir, sample_image, reference_images, in_catalog}` for every product mentioned in the article
+- `reference_images` — flat, de-duplicated list of the real packshot file paths across all specific products. **These must be attached to the image generator as references** (hero, OG, and every social-wave post). The prompt names the products; this list is what makes the model render the real packaging instead of inventing it.
 - `prompt` — the assembled image-gen prompt, ready to pass to `image_generate`
 - `suggested_filename` — semantic, cache-busting filename for the new hero
 - `frontmatter_patch` — the new `heroImage:` value to write to the article frontmatter
 - `validation_checklist` — steps to verify in production after deploy
 
-If `products` is empty or only contains generic category matches (e.g. `solutii-delta`, `tratamente-specifice`), STOP and ask the user. Generic-only matches are the failure mode this skill exists to prevent.
+Check `brief.blockers` first. If non-empty, STOP and resolve the cause:
 
-### 2. Generate the image
+- `products` empty or only generic category matches (`solutii-delta`, `tratamente-specifice`) — generic-only matches are the failure mode this skill exists to prevent.
+- Specific products detected but `reference_images` is empty — there are no real packshots to attach. Locate/download the real product images into `backend/static/images/<handle>/` (or pass them explicitly) before generating. Generating from names alone is what made the 2026-05-26 social wave invent packaging.
 
-Pass `brief.prompt` to `image_generate`. The prompt is pre-loaded with anti-collage / anti-cutout guidance and references the real product names. Do not strip those instructions.
+### 2. Generate the image (attach the real packshots)
+
+Pass `brief.prompt` **and attach every path in `brief.reference_images` as image references** to the generator (Codex / `image_generate`). The prompt names the products and forbids collage/cutout framing; the attached packshots are what force the real packaging. Never generate from the prompt alone when `reference_images` is non-empty — that reintroduces the invented-packaging bug.
 
 ```python
-result = image_generate(prompt=brief["prompt"], aspect_ratio="landscape")
+result = image_generate(
+    prompt=brief["prompt"],
+    reference_images=brief["reference_images"],  # real ARDmag packshots
+    aspect_ratio="landscape",
+)
 ```
+
+If the generator takes a single composite reference, assemble a contact sheet from `brief.reference_images` and attach that. Either way the real images must reach the model.
 
 Save the generated image to the article's media directory using `brief.suggested_filename`:
 
@@ -113,9 +123,23 @@ If production still shows the OLD image, the cause is one of:
 - CDN cache on the old filename → if you reused the old filename, this is why we use a new one
 - frontmatter still points to the old file → re-check the patch landed
 
+## Social Promotion Wave
+
+A social promotion wave is a batch of post visuals (Instagram/Facebook square + story, OG preview, etc.) for an article. It uses the **same brief and the same discipline as the hero** — there is no separate, looser path for social.
+
+1. Build the brief once (Procedure §1) for the article. Reuse its `products` and `reference_images`.
+2. For **every** post in the wave, attach `brief.reference_images` (the real ARDmag packshots) to the Codex/imagegen call — exactly as for the hero. Vary only crop / aspect ratio / composition, never the packaging source.
+   - Square post: `aspect_ratio="square"`
+   - Story / vertical: `aspect_ratio="portrait"`
+   - OG / link preview: `aspect_ratio="landscape"`, same scene as the hero (see `references/visual-rules.md` → "Same-source previews").
+3. Require the real products to appear organically in each post image — on stone samples / workbench, packaging matching the references, no collage, no floating cutouts.
+4. If `brief.reference_images` is empty, STOP — do not let the wave run from product names alone. That is precisely how the 2026-05-26 wave shipped real names (SEAL, QUASAR, WET SEAL, IDROREP, ECO STONE PRO) on AI-invented packaging.
+
+Re-run the brief builder per article; do not hand-maintain a separate product list for social.
+
 ## Hard Rules (Non-Negotiable)
 
-These rules are encoded in `prompts/hero_image.md` and applied by the brief builder. They exist because of a real incident (Delta Research hero, 2026-05-26) where each was violated:
+These rules are encoded in `prompts/hero_image.md` and applied by the brief builder. They exist because of real incidents (Delta Research hero and social wave, 2026-05-26) where each was violated:
 
 1. **No collages.** No grid of cropped product shots. No cutouts pasted onto a background.
 2. **No floating products.** No products hovering against a solid color or studio gradient.
@@ -124,6 +148,7 @@ These rules are encoded in `prompts/hero_image.md` and applied by the brief buil
 5. **No generic-category-only mapping.** If the article names `SEAL`, `QUASAR`, `IDROREP` etc., the prompt must reference those specific products — not just "treatment products" or `solutii-delta`.
 6. **No filename reuse.** When replacing a conceptually wrong hero, use a new semantic filename (e.g. `hero-delta-research-tratamente.webp`), not the old `hero.webp`.
 7. **No "done" without production validation.** Build success is not the bar. The production HTML must reference the new filename and the image must render correctly.
+8. **No generation without the real packshots attached.** For the hero, the OG preview, and every social-wave post, the real product images from `brief.reference_images` must be attached to the generator as references. Naming the products in the prompt is not enough — that is what made the social wave invent packaging for real product names.
 
 ## Pitfalls
 
@@ -134,9 +159,10 @@ These rules are encoded in `prompts/hero_image.md` and applied by the brief buil
 
 ## Verification
 
-The image is acceptable if:
+The image (hero or any social-wave post) is acceptable if:
 
 - The brief's `products` list is non-empty and at least one entry has `asset_dir` populated
-- The generated image shows the named products with readable labels, integrated on stone / workshop context, no collage
+- `brief.reference_images` is non-empty and those real packshots were attached to the generation call
+- The generated image shows the named products with **packaging matching the references** and readable labels, integrated on stone / workshop context, no collage
 - `suggested_filename` differs from any existing hero filename for that article
 - After push, production HTML contains `suggested_filename` and the image URL returns 200

@@ -5,13 +5,14 @@ Captured from the 2026-05-26 Delta Research hero incident and from the broader A
 ## Source-of-truth principles
 
 1. **Organic realistic scenes.** Stone workshop / atelier with actual stone samples and worn wood. Not a studio backdrop, not a website hero gradient, not a 3D render.
-2. **Same-source previews.** The OG / social preview and the article hero share the same scene. No swapping in a different aesthetic for social.
-3. **Article-specific products only.** Use the exact products the article names. If the article says SEAL and QUASAR, the bottles in the image are SEAL and QUASAR.
-4. **Generic categories are a fallback, not a default.** Mapping a Delta Research article to `solutii-delta/` instead of to the specific products is the bug, not the feature.
-5. **Tenax appears only when the article is about Tenax.** Cross-brand bottles in a Delta scene are wrong, even if they look photogenic.
-6. **Varied makers in industry-overview articles.** When an article surveys the category (e.g. "how to choose"), more than one brand may appear — but the brand assignment must still match what the article names.
-7. **Context-correct products.** A hydrophobic treatment article should not feature polishing pads in the foreground.
-8. **No dark logo patches.** No black bar/strip behind logos.
+2. **Real packshots attached, always.** The actual ARDmag product images (`brief.reference_images`) must be attached to the generator as references for the hero, the OG preview, and every social-wave post. Naming the products in the prompt is not enough — that is how the 2026-05-26 social wave shipped real names (SEAL, QUASAR, WET SEAL, IDROREP, ECO STONE PRO) on AI-invented packaging. If there are no real packshots to attach, do not generate.
+3. **Same-source previews.** The OG / social preview and the article hero share the same scene. No swapping in a different aesthetic for social.
+4. **Article-specific products only.** Use the exact products the article names. If the article says SEAL and QUASAR, the bottles in the image are SEAL and QUASAR.
+5. **Generic categories are a fallback, not a default.** Mapping a Delta Research article to `solutii-delta/` instead of to the specific products is the bug, not the feature.
+6. **Tenax appears only when the article is about Tenax.** Cross-brand bottles in a Delta scene are wrong, even if they look photogenic.
+7. **Varied makers in industry-overview articles.** When an article surveys the category (e.g. "how to choose"), more than one brand may appear — but the brand assignment must still match what the article names.
+8. **Context-correct products.** A hydrophobic treatment article should not feature polishing pads in the foreground.
+9. **No dark logo patches.** No black bar/strip behind logos.
 
 ## Cache-busting filename convention
 

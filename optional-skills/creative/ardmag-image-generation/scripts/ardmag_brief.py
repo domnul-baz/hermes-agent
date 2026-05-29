@@ -306,20 +306,41 @@ def resolve_assets(
                 asset_dir = available[cand]
                 break
         sample = None
+        reference_images: list[str] = []
         if asset_dir is not None:
             for child in sorted(asset_dir.iterdir()):
                 if child.is_file() and child.suffix.lower() in IMAGE_EXTS:
-                    sample = child
-                    break
+                    reference_images.append(str(child))
+                    if sample is None:
+                        sample = child
         resolved.append(
             {
                 **product,
                 "asset_dir": str(asset_dir) if asset_dir else None,
                 "sample_image": str(sample) if sample else None,
+                # Every real packshot in the asset dir — these are the files
+                # that MUST be attached to Codex/imagegen as image references
+                # so the generated packaging matches reality instead of being
+                # invented (the 2026-05-26 social-wave failure).
+                "reference_images": reference_images,
                 "is_generic": slug in GENERIC_CATEGORY_SLUGS,
             }
         )
     return resolved
+
+
+def collect_reference_images(products: list[dict[str, Any]]) -> list[str]:
+    """Flatten the real packshot paths across all specific (non-generic)
+    products into a de-duplicated, ordered list. These are the files an image
+    generator must receive as references."""
+    refs: list[str] = []
+    for product in products:
+        if product.get("is_generic"):
+            continue
+        for img in product.get("reference_images") or []:
+            if img not in refs:
+                refs.append(img)
+    return refs
 
 
 # ── filename suggester ──────────────────────────────────────────────────────
@@ -393,13 +414,30 @@ def build_prompt(
         line = f"- {product['name']}"
         if product.get("catalog_name") and product["catalog_name"].upper() != product["name"].upper():
             line += f" ({product['catalog_name']})"
-        if product.get("asset_dir"):
-            line += f"  [reference: {product['asset_dir']}]"
+        if product.get("sample_image"):
+            line += f"  [packshot: {product['sample_image']}]"
+        elif product.get("asset_dir"):
+            line += f"  [asset dir: {product['asset_dir']}]"
         product_lines.append(line)
 
     if not product_lines:
         product_lines.append(
             "- (NONE — refuse to generate until at least one specific product is identified)"
+        )
+
+    reference_images = collect_reference_images(products)
+    if reference_images:
+        reference_block = (
+            "The following real ARDmag product packshots are ATTACHED to this "
+            "request as image references. Reproduce each product's packaging, "
+            "label layout, typography and colours exactly as shown — do not "
+            "invent, redesign, or approximate packaging:\n"
+            + "\n".join(f"- {path}" for path in reference_images)
+        )
+    else:
+        reference_block = (
+            "(NO real packshots resolved — DO NOT generate. Locate and attach "
+            "the real product images first; inventing packaging is forbidden.)"
         )
 
     brand_label = {
@@ -413,6 +451,7 @@ def build_prompt(
         article_title=title or "(untitled)",
         scene_surfaces=_scene_surfaces_for(brand, products),
         product_list_block="\n".join(product_lines),
+        reference_block=reference_block,
         brand_label=brand_label,
         aspect_ratio=aspect_ratio,
     )
@@ -443,6 +482,7 @@ def build_brief(
     specific_products = [p for p in products if not p.get("is_generic")]
     only_generic = bool(products) and not specific_products
     no_products = not products
+    reference_images = collect_reference_images(products)
 
     blockers: list[str] = []
     if no_products:
@@ -458,6 +498,18 @@ def build_brief(
             "the detector. Re-run after tightening detection or naming the "
             "products manually."
         )
+    # If we resolved assets but found no real packshots to attach, refuse:
+    # generating from product names alone is exactly what produced invented
+    # packaging in the 2026-05-26 social wave.
+    if assets_root is not None and specific_products and not reference_images:
+        blockers.append(
+            "Specific products were detected but no real product images were "
+            "found under the assets root to attach as Codex/imagegen "
+            "references. Refusing — generating from product names alone makes "
+            "the model invent packaging (the 2026-05-26 social-wave failure). "
+            "Locate/download the real packshots into the product asset dirs "
+            "(or pass them explicitly) before generating."
+        )
 
     prompt = build_prompt(
         title=detection["title"],
@@ -471,12 +523,15 @@ def build_brief(
     frontmatter_patch = f"{article_dir_url}{new_filename}"
 
     checklist = [
+        "Real product packshots were ATTACHED to the generation request as "
+        "image references (not just named in the prompt)",
         "Local Next build succeeds with the new heroImage path",
         "CI on GitHub is green",
         f"Production article HTML contains '{new_filename}'",
         "Production blog list shows the new hero card",
         f"GET on the production image URL ({frontmatter_patch}) returns 200",
-        "Visual confirmation: labels readable, products integrated, no collage",
+        "Visual confirmation: packaging matches the real packshots, labels "
+        "readable, products integrated, no collage",
     ]
 
     return {
@@ -486,6 +541,10 @@ def build_brief(
         "tags": detection["tags"],
         "brand": detection["brand"],
         "products": products,
+        # Real packshot file paths to attach to Codex/imagegen as references.
+        # Applies equally to the hero, the OG/social preview, and every image
+        # in a social promotion wave.
+        "reference_images": reference_images,
         "prompt": prompt,
         "suggested_filename": new_filename,
         "frontmatter_patch": frontmatter_patch,

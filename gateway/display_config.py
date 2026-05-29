@@ -82,7 +82,9 @@ _TIER_MINIMAL = {
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Tier 1 — full edit support, personal/team use
     "telegram":    {**_TIER_HIGH, "tool_progress": "new"},
-    "discord":     _TIER_HIGH,
+    # Discord progress bubbles are regular channel messages in many deployments;
+    # keep channels quiet by default and let users opt into /verbose/debug mode.
+    "discord":     {**_TIER_HIGH, "tool_progress": "off"},
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;

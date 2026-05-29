@@ -219,6 +219,29 @@ class TestResolveAssets:
         assert by_slug["eco-stone-pro"]["asset_dir"].endswith("/eco-stone-pro")
         assert by_slug["idrorep"]["asset_dir"].endswith("/idrorep")
 
+    def test_collects_all_reference_images_per_product(
+        self, capsys, delta_article, tmp_path
+    ):
+        # Give SEAL two packshots; the resolver must surface both as references
+        # (the files an image generator has to receive), not just the sample.
+        root = tmp_path / "images"
+        root.mkdir()
+        seal = root / "seal"
+        seal.mkdir()
+        (seal / "seal-001.jpg").write_bytes(b"\x00")
+        (seal / "seal-002.webp").write_bytes(b"\x00")
+        result = _run(
+            capsys,
+            ["resolve-assets", "--article", str(delta_article), "--assets-root", str(root)],
+        )
+        by_slug = {p["slug"]: p for p in result["products"]}
+        refs = by_slug["seal"]["reference_images"]
+        assert len(refs) == 2
+        assert any(r.endswith("seal-001.jpg") for r in refs)
+        assert any(r.endswith("seal-002.webp") for r in refs)
+        # sample_image stays the first one for back-compat.
+        assert by_slug["seal"]["sample_image"].endswith("seal-001.jpg")
+
     def test_unknown_product_has_no_asset(self, capsys, tmp_path, assets_root):
         article = tmp_path / "mystery.md"
         article.write_text(
@@ -232,6 +255,7 @@ class TestResolveAssets:
         )
         assert result["products"][0]["asset_dir"] is None
         assert result["products"][0]["sample_image"] is None
+        assert result["products"][0]["reference_images"] == []
 
     def test_generic_category_flagged(self, capsys, generic_article, assets_root):
         # Generic article mentions **Tratamente Specifice** which slugifies
@@ -319,6 +343,57 @@ class TestBuildBrief:
 
         # No blockers for a well-formed article.
         assert result["blockers"] == []
+
+    def test_brief_surfaces_reference_images_to_attach(
+        self, capsys, delta_article, assets_root, catalog_csv
+    ):
+        result = _run(
+            capsys,
+            [
+                "build-brief",
+                "--article",
+                str(delta_article),
+                "--assets-root",
+                str(assets_root),
+                "--catalog",
+                str(catalog_csv),
+            ],
+        )
+        # Top-level reference_images is the flat list of real packshots that
+        # must be attached to the generator — for hero AND social-wave posts.
+        refs = result["reference_images"]
+        assert refs, "expected real packshot paths to attach"
+        assert any(r.endswith("/seal/seal-001.jpg") for r in refs)
+        assert any(r.endswith("/quasar/quasar-001.jpg") for r in refs)
+        # Generic category packshots must not be attached.
+        assert not any("solutii-delta" in r for r in refs)
+
+        # The prompt names the real packshot paths and forbids invented packaging.
+        prompt_lower = result["prompt"].lower()
+        assert "reference image" in prompt_lower
+        assert "invent" in prompt_lower and "packaging" in prompt_lower
+        assert any(r in result["prompt"] for r in refs)
+
+        # The checklist reminds that packshots must be attached, not just named.
+        assert any(
+            "attached" in step.lower() and "reference" in step.lower()
+            for step in result["validation_checklist"]
+        )
+
+    def test_specific_products_without_packshots_yields_blocker(
+        self, capsys, delta_article, tmp_path
+    ):
+        # assets root exists but holds no product dirs — so the real products
+        # resolve to zero packshots. Generating from names alone is the bug,
+        # so the brief must refuse.
+        empty_root = tmp_path / "empty-images"
+        empty_root.mkdir()
+        result = _run(
+            capsys,
+            ["build-brief", "--article", str(delta_article), "--assets-root", str(empty_root)],
+        )
+        assert result["reference_images"] == []
+        assert any("no real product images" in b.lower() for b in result["blockers"])
 
     def test_no_products_yields_blocker(self, capsys, tmp_path, assets_root):
         article = tmp_path / "empty.md"
