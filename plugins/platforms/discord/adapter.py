@@ -84,6 +84,12 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
 
+
+def _discord_prompt_markdown_title(title: str, body: str) -> str:
+    clean_title = (title or "Confirm").strip() or "Confirm"
+    return f"### {clean_title}\n\n{body}"
+
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -5292,10 +5298,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Discord embed description limit is 4096; show full command up to that
             max_desc = 4088
-            cmd_display = command if len(command) <= max_desc else command[: max_desc - 3] + "..."
+            heading = "### ⚠️ Command Approval Required\n\n"
+            cmd_budget = max_desc - len(heading) - len("```\n\n```")
+            cmd_display = command if len(command) <= cmd_budget else command[: cmd_budget - 3] + "..."
             embed = discord.Embed(
-                title="⚠️ Command Approval Required",
-                description=f"```\n{cmd_display}\n```",
+                description=f"{heading}```\n{cmd_display}\n```",
                 color=discord.Color.orange(),
             )
             embed.add_field(name="Reason", value=description, inline=False)
@@ -5332,10 +5339,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Embed description limit is 4096; message usually fits easily.
             max_desc = 4088
-            body = message if len(message) <= max_desc else message[: max_desc - 3] + "..."
+            heading = f"### {(title or 'Confirm').strip() or 'Confirm'}\n\n"
+            body_budget = max_desc - len(heading)
+            body = message if len(message) <= body_budget else message[: body_budget - 3] + "..."
             embed = discord.Embed(
-                title=title or "Confirm",
-                description=body,
+                description=f"{heading}{body}",
                 color=discord.Color.orange(),
             )
 
@@ -5488,8 +5496,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             default_hint = f" (default: {default})" if default else ""
             embed = discord.Embed(
-                title="⚕ Update Needs Your Input",
-                description=f"{prompt}{default_hint}",
+                description=_discord_prompt_markdown_title(
+                    "⚕ Update Needs Your Input",
+                    f"{prompt}{default_hint}",
+                ),
                 color=discord.Color.gold(),
             )
             view = UpdatePromptView(
