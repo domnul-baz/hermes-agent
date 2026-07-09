@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,90 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str | None) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def _clean_cron_failure_text(error: str | None, *, limit: int | None = None) -> str:
+    """Collapse noisy cron errors into delivery/incident-safe text."""
+    text = _strip_ansi(error or "unknown error").strip()
+    text = re.sub(
+        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
+        "",
+        text[:4000],
+    )
+    lines = []
+    skipping_traceback = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Traceback (most recent call last):"):
+            skipping_traceback = True
+            continue
+        if skipping_traceback:
+            if re.match(r"^[A-Za-z_][\w.]*?(Error|Exception|Timeout|Failure)\b", stripped):
+                skipping_traceback = False
+            else:
+                continue
+        if re.match(r'^File ".+", line \d+', stripped):
+            continue
+        if stripped:
+            lines.append(stripped)
+    cleaned = re.sub(r"\s+", " ", " ".join(lines) or text).strip()
+    if limit is not None and len(cleaned) > limit:
+        cleaned = cleaned[: max(0, limit - 3)].rstrip() + "..."
+    return cleaned or "unknown error"
+
+
+def _classify_cron_failure(error: str | None) -> tuple[str, str]:
+    """Return (class_key, compact English reason) for a cron failure."""
+    text = _strip_ansi(error or "unknown error").strip()
+    lower = text.lower()
+
+    if (
+        "429" in text
+        or "rate limit" in lower
+        or "usage limit" in lower
+        or "weekly limit" in lower
+        or "weekly usage limit" in lower
+    ):
+        reason = "rate limit"
+        if "weekly" in lower and "limit" in lower:
+            reason = "weekly usage limit"
+        elif "quota" in lower:
+            reason = "quota limit"
+        return "usage_limit", reason
+
+    if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
+        return "timeout", "timeout"
+
+    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
+        return "auth", "authentication error"
+
+    return "script_error", "script error"
+
+
+_CRON_FAILURE_LABELS = {
+    "usage_limit": "limită de utilizare",
+    "timeout": "timeout",
+    "auth": "autentificare",
+    "script_error": "eroare script",
+}
+
+_CRON_FAILURE_TITLE_LABELS = {
+    "usage_limit": "limita de utilizare",
+    "timeout": "timeout",
+    "auth": "autentificare",
+    "script_error": "eroare script",
+}
+
+
+def _slugify_cron_component(value: str | None) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+    return slug or "job"
+
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
@@ -55,23 +140,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     stack traces into the delivery channel.
     """
     job_name = job.get("name") or job.get("id") or "cron job"
-    text = (error or "unknown error").strip()
-    lower = text.lower()
+    class_key, reason = _classify_cron_failure(error)
 
     # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
-        reason = "rate limit"
-        if "weekly usage limit" in lower:
-            reason = "weekly usage limit"
-        elif "quota" in lower:
-            reason = "quota limit"
+    if class_key == "usage_limit":
         return (
             f"⚠️ Cron '{job_name}' failed: provider {reason}. "
             "Fallback chain was exhausted or unavailable. "
             "Full details saved in cron output."
         )
 
-    if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
+    if class_key == "timeout":
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
             "Fallback chain was exhausted or unavailable. "
@@ -81,23 +160,100 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # Match authentication/authorization wording at a word boundary and the
     # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
     # not trip a misleading auth message.
-    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
+    if class_key == "auth":
         return (
             f"⚠️ Cron '{job_name}' failed: provider authentication error. "
             "Full details saved in cron output."
         )
 
-    # Strip common exception wrappers and collapse provider payloads. Bound
-    # the input first so a multi-KB provider blob cannot slow the
-    # substitutions.
-    cleaned = re.sub(
-        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
-        "", text[:2000],
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
+    cleaned = _clean_cron_failure_text(error, limit=180)
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+
+
+def report_cron_failure_incident(job: dict, error: str | None) -> dict | None:
+    """Best-effort report of a cron failure to the configured incident CLI."""
+    try:
+        cfg = load_config() or {}
+        cron_cfg = (cfg.get("cron") or {}) if isinstance(cfg, dict) else {}
+        incident_cli = (cron_cfg.get("incident_cli") or "").strip()
+        if not incident_cli:
+            return None
+
+        incident_workdir = (cron_cfg.get("incident_workdir") or "").strip()
+        workdir = Path(_expand_env_vars(incident_workdir)).expanduser() if incident_workdir else _get_hermes_home()
+        if not workdir.is_absolute():
+            workdir = _get_hermes_home() / workdir
+
+        class_key, _ = _classify_cron_failure(error)
+        job_id = str(job.get("id") or "unknown")
+        job_name = str(job.get("name") or job_id or "cron job")
+        details = (
+            f"{_clean_cron_failure_text(error, limit=500)} "
+            f"| job_id={job_id} | run={job.get('last_run_at') or job.get('next_run_at') or ''}"
+        )
+        argv = shlex.split(_expand_env_vars(incident_cli)) + [
+            "report",
+            f"--component=cron:{_slugify_cron_component(job_name)}",
+            "--severity=warning",
+            "--criterion=C1",
+            f"--title=Cron {job_name}: {_CRON_FAILURE_TITLE_LABELS[class_key]}",
+            f"--details={details}",
+            "--source=cron",
+            f"--fingerprint=cron:{job_id}:{class_key}",
+            "--sync-wiki",
+        ]
+        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(workdir),
+            **popen_kwargs,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Cron incident CLI failed for job '%s' with exit %s: %s",
+                job_id,
+                result.returncode,
+                _clean_cron_failure_text(result.stderr or result.stdout, limit=300),
+            )
+            return None
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            logger.warning("Cron incident CLI returned invalid JSON for job '%s': %s", job_id, exc)
+            return None
+        if not isinstance(payload, dict) or not payload.get("ok") or not payload.get("id"):
+            logger.warning("Cron incident CLI returned no ticket for job '%s': %r", job_id, payload)
+            return None
+        return payload
+    except Exception as exc:
+        logger.warning("Cron incident reporting failed open for job '%s': %s", job.get("id", "?"), exc)
+        return None
+
+
+def _format_cron_failure_incident_delivery(job: dict, error: str | None, incident: dict) -> str:
+    job_name = str(job.get("name") or job.get("id") or "cron job")
+    class_key, _ = _classify_cron_failure(error)
+    label = _CRON_FAILURE_LABELS[class_key]
+    suffix = " — se reia automat după reset" if class_key == "usage_limit" else ""
+    action = incident.get("action")
+    ticket = (
+        f"tichet nou #{incident.get('id')}"
+        if action == "created"
+        else f"Tichet #{incident.get('id')}"
+    )
+    occurrence = incident.get("occurrences") or 1
+    line2_parts = [ticket, f"apariția {occurrence}"]
+    if incident.get("wiki_url"):
+        line2_parts.append(str(incident["wiki_url"]))
+    snippet = _clean_cron_failure_text(error, limit=200)
+    return (
+        f"⚠️ **{job_name}** — eșuat ({label}){suffix}\n"
+        f"{' · '.join(line2_parts)}\n"
+        f"||{snippet}||"
+    )
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -1217,7 +1373,13 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    wrap_response_override: Optional[bool] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1258,11 +1420,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # in config.yaml for clean output.
     wrap_response = True
     user_cfg = None
-    try:
-        user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
+    if wrap_response_override is None:
+        try:
+            user_cfg = load_config()
+            wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        except Exception:
+            pass
+    else:
+        wrap_response = bool(wrap_response_override)
+        try:
+            user_cfg = load_config()
+        except Exception:
+            pass
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -3142,7 +3311,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # Deliver the final response to the origin/target chat.
         # If the agent responded with [SILENT], skip delivery (but
         # output is already saved above).  Failed jobs always deliver.
-        deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+        wrap_delivery_response = None
+        if success:
+            deliver_content = final_response
+        else:
+            incident = report_cron_failure_incident(job, error)
+            deliver_content = (
+                _format_cron_failure_incident_delivery(job, error, incident)
+                if incident
+                else _summarize_cron_failure_for_delivery(job, error)
+            )
+            wrap_delivery_response = False
         # Treat whitespace-only final responses the same as empty
         # responses: do not deliver a blank message, and let the
         # empty-response guard below mark the run as a soft failure.
@@ -3160,7 +3339,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                delivery_error = _deliver_result(
+                    job,
+                    deliver_content,
+                    adapters=adapters,
+                    loop=loop,
+                    wrap_response_override=wrap_delivery_response,
+                )
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)

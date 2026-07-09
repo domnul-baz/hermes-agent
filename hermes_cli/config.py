@@ -2564,6 +2564,10 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Optional external incident bridge for failed cron jobs. Empty keeps
+        # historical delivery-only behavior.
+        "incident_cli": "",
+        "incident_workdir": "",
     },
 
     # Kanban multi-agent coordination — controls the dispatcher loop that

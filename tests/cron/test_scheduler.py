@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -2528,6 +2529,130 @@ class TestSilentDelivery:
         assert not sil("[SILENT")  # malformed open-bracket is not the sentinel
         assert not sil("")
         assert not sil("   \n\t ")
+
+
+class TestCronFailureIncidents:
+    def _make_job(self):
+        return {
+            "id": "monitor-job",
+            "name": "Daily Monitor",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+            "last_run_at": "2026-07-09T10:00:00+00:00",
+        }
+
+    def test_classify_cron_failure_contract(self):
+        from cron.scheduler import _classify_cron_failure
+
+        assert _classify_cron_failure("You've hit your weekly limit")[0] == "usage_limit"
+        assert _classify_cron_failure("ReadTimeout: request timed out")[0] == "timeout"
+        assert _classify_cron_failure("HTTP 403 authentication failed")[0] == "auth"
+        assert _classify_cron_failure("Script exited with code 1")[0] == "script_error"
+
+    def test_incident_bridge_disabled_without_config(self):
+        from cron.scheduler import report_cron_failure_incident
+
+        with patch("cron.scheduler.load_config", return_value={"cron": {}}), \
+             patch("cron.scheduler.subprocess.run") as run_mock:
+            assert report_cron_failure_incident(self._make_job(), "boom") is None
+
+        run_mock.assert_not_called()
+
+    def test_incident_bridge_fail_open_when_cli_crashes(self, caplog):
+        from cron.scheduler import report_cron_failure_incident
+
+        cfg = {"cron": {"incident_cli": "node /tmp/incident-cli.js", "incident_workdir": "/tmp"}}
+        with patch("cron.scheduler.load_config", return_value=cfg), \
+             patch("cron.scheduler.subprocess.run", side_effect=RuntimeError("crashed")):
+            with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+                assert report_cron_failure_incident(self._make_job(), "boom") is None
+
+        assert any("failed open" in rec.message for rec in caplog.records)
+
+    def test_incident_bridge_builds_report_command_and_strips_ansi(self):
+        from cron.scheduler import report_cron_failure_incident
+
+        payload = {
+            "ok": True,
+            "action": "incremented",
+            "id": 42,
+            "fingerprint": "cron:monitor-job:script_error",
+            "occurrences": 3,
+        }
+        cfg = {"cron": {"incident_cli": "node /tmp/incident-cli.js", "incident_workdir": "/tmp"}}
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with patch("cron.scheduler.load_config", return_value=cfg), \
+             patch("cron.scheduler.subprocess.run", return_value=completed) as run_mock:
+            assert report_cron_failure_incident(self._make_job(), "\x1b[31mScript failed\x1b[0m") == payload
+
+        argv = run_mock.call_args.args[0]
+        assert "report" in argv
+        assert "--component=cron:daily-monitor" in argv
+        assert "--fingerprint=cron:monitor-job:script_error" in argv
+        assert "--title=Cron Daily Monitor: eroare script" in argv
+        assert any(arg.startswith("--details=Script failed | job_id=monitor-job") for arg in argv)
+        assert "\x1b[31m" not in " ".join(argv)
+
+    def test_format_incident_message_with_wiki_url_for_usage_limit(self):
+        from cron.scheduler import _format_cron_failure_incident_delivery
+
+        message = _format_cron_failure_incident_delivery(
+            self._make_job(),
+            "\x1b[31mYou've hit your weekly limit\x1b[0m\nTraceback (most recent call last):\n  File \"x\", line 1",
+            {
+                "ok": True,
+                "action": "created",
+                "id": 42,
+                "occurrences": 1,
+                "wiki_url": "https://wiki.example/incidents/42",
+            },
+        )
+
+        assert message.splitlines() == [
+            "⚠️ **Daily Monitor** — eșuat (limită de utilizare) — se reia automat după reset",
+            "tichet nou #42 · apariția 1 · https://wiki.example/incidents/42",
+            "||You've hit your weekly limit||",
+        ]
+        assert "\x1b[31m" not in message
+        assert "Traceback" not in message
+
+    def test_format_incident_message_without_wiki_url_for_script_error(self):
+        from cron.scheduler import _format_cron_failure_incident_delivery
+
+        message = _format_cron_failure_incident_delivery(
+            self._make_job(),
+            "ValueError: script exploded",
+            {"ok": True, "action": "incremented", "id": 42, "occurrences": 7},
+        )
+
+        assert message.splitlines() == [
+            "⚠️ **Daily Monitor** — eșuat (eroare script)",
+            "Tichet #42 · apariția 7",
+            "||script exploded||",
+        ]
+
+    def test_failed_job_delivers_incident_message_without_wrapper(self):
+        incident = {"ok": True, "action": "created", "id": 42, "occurrences": 1}
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "You've hit your weekly limit")), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler.report_cron_failure_incident", return_value=incident), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_called_once()
+        content = deliver_mock.call_args.args[1]
+        assert content.startswith("⚠️ **Daily Monitor**")
+        assert "Cronjob Response:" not in content
+        assert "To stop or manage this job" not in content
+        assert deliver_mock.call_args.kwargs["wrap_response_override"] is False
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
