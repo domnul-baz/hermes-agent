@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, DISCORD_FORMAT_CONTRACT
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -639,6 +639,7 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
+        assert "To stop or manage this job" not in sent_content
         assert "The agent cannot see" not in sent_content
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
@@ -3056,6 +3057,30 @@ class TestBuildJobPromptBumpUse:
         assert "go" in result
         # The error should be logged at DEBUG level, not crash
         assert any("failed to bump" in r.message for r in caplog.records)
+
+
+class TestBuildJobPromptDiscordFormatContract:
+    def test_contract_is_added_by_default_for_agent_job(self):
+        with patch("cron.scheduler.load_config", return_value={"cron": {"format_contract": True}}):
+            result = _build_job_prompt({"prompt": "rezuma statusul"})
+
+        assert DISCORD_FORMAT_CONTRACT.strip() in result
+        assert "/discord-standard" in result
+        assert "Prima linie este verdictul" in result
+
+    def test_contract_can_be_disabled(self):
+        with patch("cron.scheduler.load_config", return_value={"cron": {"format_contract": False}}):
+            result = _build_job_prompt({"prompt": "rezuma statusul"})
+
+        assert DISCORD_FORMAT_CONTRACT.strip() not in result
+        assert "/discord-standard" not in result
+
+    def test_no_agent_job_does_not_get_contract(self):
+        with patch("cron.scheduler.load_config", return_value={"cron": {"format_contract": True}}):
+            result = _build_job_prompt({"prompt": "ruleaza scriptul", "no_agent": True})
+
+        assert DISCORD_FORMAT_CONTRACT.strip() not in result
+        assert "/discord-standard" not in result
 
 
 class TestSendMediaViaAdapter:

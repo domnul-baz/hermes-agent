@@ -73,6 +73,23 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_DISCORD_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_DISCORD_FENCE_RE = re.compile(r"(```.*?```)", re.DOTALL)
+
+
+def _collapse_blank_lines_outside_code_fences(text: str) -> str:
+    parts = _DISCORD_FENCE_RE.split(text)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"[ \t]+(?=\r?\n|$)", "", parts[i])
+        parts[i] = re.sub(r"\n(?:[ \t]*\n){3,}", "\n\n", parts[i])
+    return "".join(parts)
+
+
+def sanitize_discord_content(text) -> str:
+    """Apply deterministic Discord text hygiene without changing semantics."""
+    cleaned = _DISCORD_ANSI_ESCAPE_RE.sub("", str(text or ""))
+    cleaned = _collapse_blank_lines_outside_code_fences(cleaned)
+    return cleaned.strip()
 
 
 def _sanitize_error_text(text) -> str:
@@ -778,6 +795,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # For short messages or platforms without a known limit this is a no-op.
     # Telegram measures length in UTF-16 code units, not Unicode codepoints.
     max_len = _MAX_LENGTHS.get(platform)
+    if platform == Platform.DISCORD:
+        message = sanitize_discord_content(message)
     if max_len:
         _len_fn = utf16_len if platform == Platform.TELEGRAM else None
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)

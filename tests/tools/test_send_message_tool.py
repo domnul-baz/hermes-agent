@@ -33,6 +33,7 @@ from tools.send_message_tool import (
     _send_signal,
     _send_telegram,
     _send_to_platform,
+    sanitize_discord_content,
     send_message_tool,
 )
 # Discord helpers moved to the plugin in #24325.  Import from the new path
@@ -658,6 +659,39 @@ class TestSendTelegramMediaDelivery:
 
 
 class TestSendToPlatformChunking:
+    def test_sanitize_discord_content_strips_ansi(self):
+        assert sanitize_discord_content("\x1b[31mAlert\x1b[0m") == "Alert"
+
+    def test_sanitize_discord_content_collapses_blank_lines_outside_fences(self):
+        raw = "one\n\n\n\ntwo\n```text\nalpha\n\n\n\nbeta\n```\n\n\nthree"
+        cleaned = sanitize_discord_content(raw)
+        assert cleaned == "one\n\ntwo\n```text\nalpha\n\n\n\nbeta\n```\n\n\nthree"
+
+    def test_sanitize_discord_content_preserves_two_blank_lines(self):
+        assert sanitize_discord_content("one\n\n\ntwo") == "one\n\n\ntwo"
+
+    def test_sanitize_discord_content_preserves_clean_message(self):
+        clean = "Verdict: totul e ok\n- primul punct\n- al doilea punct"
+        assert sanitize_discord_content(clean) == clean
+
+    def test_discord_branch_sanitizes_before_chunking(self):
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        raw = "\x1b[32mDone\x1b[0m   \n\n\n\nNext   "
+
+        with _patch_discord_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "ch",
+                    raw,
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once()
+        assert send.await_args.args[2] == "Done\n\nNext"
+
     def test_long_message_is_chunked(self):
         """Messages exceeding the platform limit are split into multiple sends."""
         send = AsyncMock(return_value={"success": True, "message_id": "1"})
