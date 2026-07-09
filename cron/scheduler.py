@@ -65,6 +65,19 @@ from agent.delegation_context import (
 logger = logging.getLogger(__name__)
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+DISCORD_FORMAT_CONTRACT = """\
+
+## Contract de formatare pentru livrare în chat
+Dacă răspunsul tău final este livrat într-un canal de chat (Discord), formatează-l după standardul /discord-standard.
+Prima linie este verdictul: ce s-a întâmplat sau ce ai aflat.
+Țintește maxim ~10 rânduri în total și cel mult 3 bullet-uri.
+Include un singur next-step clar.
+Ascunde detaliile tehnice non-esențiale în ||spoiler|| sau spune că sunt într-un fișier/pagină wiki, cu link, nu conținut duplicat.
+Nu folosi ANSI, stack trace sau numele jobului repetat; livrarea nu mai adaugă wrapper.
+Scrie în română cu diacritice.
+Dacă DC a cerut explicit format detaliat, respectă cererea lui, dar păstrează verdictul pe primul rând.
+Dacă output-ul tău NU merge într-un chat (scrii fișiere etc.), ignoră aceste reguli.
+"""
 
 
 def _strip_ansi(text: str | None) -> str:
@@ -4372,6 +4385,22 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _cron_format_contract_enabled(job: dict) -> bool:
+    if job.get("no_agent"):
+        return False
+    try:
+        cron_cfg = load_config().get("cron", {}) or {}
+    except Exception:
+        return True
+    return cron_cfg.get("format_contract", True) is not False
+
+
+def _append_cron_format_contract(prompt: str, job: dict) -> str:
+    if not _cron_format_contract_enabled(job):
+        return prompt
+    return f"{prompt.rstrip()}\n{DISCORD_FORMAT_CONTRACT}"
+
+
 def _build_job_prompt(
     job: dict,
     prerun_script: Optional[tuple] = None,
@@ -4534,6 +4563,7 @@ def _build_job_prompt(
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
+        prompt = _append_cron_format_contract(prompt, job)
         return _scan_assembled_cron_prompt(
             prompt,
             job,
@@ -4623,7 +4653,8 @@ def _build_job_prompt(
         # data (cron hint + prompt + script output + run context). Declare
         # that boundary for the Anthropic cache planner (#81867).
         stable_prefix = append_user_instruction(parts, prompt)
-    assembled = _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    assembled_text = _append_cron_format_contract("\n".join(parts), job)
+    assembled = _scan_assembled_cron_prompt(assembled_text, job, has_skills=True)
     if stable_prefix and len(assembled) > len(stable_prefix) and assembled.startswith(stable_prefix):
         # Guarded because the injection scanner may sanitize (mutate) the
         # assembled bytes; a mismatch simply falls back to whole-message

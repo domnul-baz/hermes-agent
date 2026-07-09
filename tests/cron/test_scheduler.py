@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import (
+    DISCORD_FORMAT_CONTRACT,
     SILENT_MARKER,
     _build_job_prompt,
     _deliver_result,
@@ -1895,6 +1896,30 @@ class TestBuildJobPromptBumpUse:
             call.kwargs == {"task_id": "cron-task"}
             for call in mock_bump.call_args_list
         )
+
+
+class TestBuildJobPromptDiscordFormatContract:
+    def test_contract_is_added_by_default_for_agent_job(self):
+        with patch("cron.scheduler.load_config", return_value={"cron": {"format_contract": True}}):
+            result = _build_job_prompt({"prompt": "rezuma statusul"})
+
+        assert DISCORD_FORMAT_CONTRACT.strip() in result
+        assert "/discord-standard" in result
+        assert "Prima linie este verdictul" in result
+
+    def test_contract_can_be_disabled(self):
+        with patch("cron.scheduler.load_config", return_value={"cron": {"format_contract": False}}):
+            result = _build_job_prompt({"prompt": "rezuma statusul"})
+
+        assert DISCORD_FORMAT_CONTRACT.strip() not in result
+        assert "/discord-standard" not in result
+
+    def test_no_agent_job_does_not_get_contract(self):
+        with patch("cron.scheduler.load_config", return_value={"cron": {"format_contract": True}}):
+            result = _build_job_prompt({"prompt": "ruleaza scriptul", "no_agent": True})
+
+        assert DISCORD_FORMAT_CONTRACT.strip() not in result
+        assert "/discord-standard" not in result
 
 
 class TestSendMediaViaAdapter:
