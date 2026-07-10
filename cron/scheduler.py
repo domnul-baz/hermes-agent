@@ -102,13 +102,18 @@ def _classify_cron_failure(error: str | None) -> tuple[str, str]:
     text = _strip_ansi(error or "unknown error").strip()
     lower = text.lower()
 
-    if (
-        "429" in text
-        or "rate limit" in lower
-        or "usage limit" in lower
-        or "weekly limit" in lower
-        or "weekly usage limit" in lower
-    ):
+    # Quota classification must be anchored to an actual provider/API error.
+    # A bare substring check for "429" classified ads post id 342978963 as a
+    # provider usage limit (incident #14). Generic business output can also
+    # legitimately contain words such as limit, cap, quota, or usage.
+    has_provider_limit_evidence = any((
+        re.search(r"\b(?:http(?:\s+status)?|status(?:\s+code)?|error(?:\s+code)?|code)\s*[:= -]?\s*429\b", lower),
+        re.search(r"\b(?:rate_limit(?:ed|_exceeded)?|usage_limit_reached|quota_exceeded|resource_exhausted)\b", lower),
+        re.search(r"\b(?:rate limit|usage limit|weekly limit|quota)\s+(?:has been\s+)?(?:reached|exceeded|exhausted)\b", lower),
+        re.search(r"\b(?:you(?:'ve| have)?\s+(?:hit|reached)|your)\s+(?:weekly\s+|usage\s+)?limit\b", lower),
+        re.search(r"\btoo many requests\b", lower),
+    ))
+    if has_provider_limit_evidence:
         reason = "rate limit"
         if "weekly" in lower and "limit" in lower:
             reason = "weekly usage limit"

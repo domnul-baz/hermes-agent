@@ -2546,9 +2546,33 @@ class TestCronFailureIncidents:
         from cron.scheduler import _classify_cron_failure
 
         assert _classify_cron_failure("You've hit your weekly limit")[0] == "usage_limit"
+        assert _classify_cron_failure(
+            "Error code: 429 - {'error': {'type': 'usage_limit_reached', "
+            "'message': 'The usage limit has been reached'}}"
+        )[0] == "usage_limit"
         assert _classify_cron_failure("ReadTimeout: request timed out")[0] == "timeout"
         assert _classify_cron_failure("HTTP 403 authentication failed")[0] == "auth"
         assert _classify_cron_failure("Script exited with code 1")[0] == "script_error"
+
+    def test_ads_readback_incident_payload_is_not_a_usage_limit(self):
+        from cron.scheduler import _classify_cron_failure
+
+        # Regression payload from incident #14. The post id contains the
+        # digits 429, while the output contains ordinary ads warnings.
+        payload = """Script exited with code 1
+stdout:
+[ads-readback] aibaza.ro
+{
+  "ok": true,
+  "status": "attention",
+  "post_id": 342978963,
+  "reason": "no_local_confirmation_signal",
+  "warning": "targetCpa missing; CPA kill/scale checks skipped",
+  "business_note": "usage/cap/limit values are advisory"
+}
+error: failed to push some refs to 'github.com:dobrician/aibaza-ops.git'"""
+
+        assert _classify_cron_failure(payload)[0] == "script_error"
 
     def test_incident_bridge_disabled_without_config(self):
         from cron.scheduler import report_cron_failure_incident
