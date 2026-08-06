@@ -95,6 +95,76 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
 
+_DISCORD_MACHINE_RESULT_KEYS = frozenset({
+    "builders", "exit_code", "mode", "ok", "result", "results", "stderr",
+    "stdout", "tool_call_id", "tool_name",
+})
+_DISCORD_RAW_LOG_RE = re.compile(
+    r"(?im)^(?:\[[^\n]{0,80}\]\s*)?(?:traceback\b|(?:stderr|stdout|exit_code|tool_result)\s*[:=])"
+)
+
+
+def _humanize_raw_discord_output(content: str) -> str:
+    """Replace machine output with a human outcome at the last Discord boundary.
+
+    The original payload remains in the agent/session logs.  This is a final
+    safety net for interrupted turns and other delivery paths that bypass the
+    higher-level cron/report guards.
+    """
+    text = str(content or "")
+    stripped = text.strip()
+    if not stripped:
+        return text
+
+    payload: Any = None
+    try:
+        payload = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        payload = None
+
+    is_machine_result = False
+    failed = False
+    if isinstance(payload, dict):
+        keys = {str(key).lower() for key in payload}
+        is_machine_result = bool(keys & _DISCORD_MACHINE_RESULT_KEYS)
+        failed = (
+            payload.get("ok") is False
+            or payload.get("success") is False
+            or payload.get("failed") is True
+            or payload.get("error") not in (None, "", False, [])
+            or payload.get("errors") not in (None, "", False, [])
+            or payload.get("exit_code") not in (None, 0, "0")
+        )
+    elif isinstance(payload, list):
+        is_machine_result = bool(payload) and all(isinstance(item, dict) for item in payload)
+        failed = any(
+            item.get("ok") is False
+            or item.get("success") is False
+            or item.get("error") not in (None, "", False, [])
+            for item in payload
+        ) if is_machine_result else False
+    elif _DISCORD_RAW_LOG_RE.search(stripped):
+        is_machine_result = True
+        failed = True
+
+    if not is_machine_result:
+        return text
+
+    fingerprint = hashlib.sha256(stripped.encode("utf-8", errors="replace")).hexdigest()[:12]
+    logger.warning(
+        "[%s] Blocked raw machine output from Discord delivery (failed=%s, sha256=%s); raw payload remains in session logs",
+        "Discord", failed, fingerprint,
+    )
+    if failed:
+        return (
+            "⚠️ Operațiunea nu s-a încheiat corect și necesită verificare. "
+            "Detaliile tehnice au rămas în jurnal, fără a fi expuse pe Discord."
+        )
+    return (
+        "✅ Operațiunea s-a încheiat corect. Rezultatul tehnic a rămas în jurnal, "
+        "iar pe Discord este afișată doar concluzia."
+    )
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -2832,6 +2902,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            content = _humanize_raw_discord_output(content)
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -3095,6 +3166,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
+            content = _humanize_raw_discord_output(content)
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
