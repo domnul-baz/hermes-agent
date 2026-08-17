@@ -95,6 +95,24 @@ class TestMarkRunningJobsInterrupted:
 
         assert "job-1" in sched._interrupted_job_ids
 
+    def test_retries_only_jobs_with_explicit_interruption_opt_in(self):
+        import cron.scheduler as sched
+
+        sched._running_job_ids.update({"internal", "client-report"})
+
+        def _job(job_id):
+            return {"id": job_id, "retry_on_interruption": job_id == "internal"}
+
+        with (
+            patch("cron.scheduler.mark_job_run"),
+            patch("cron.scheduler.get_job", side_effect=_job),
+            patch("cron.scheduler.trigger_job") as trigger,
+        ):
+            marked = sched.mark_running_jobs_interrupted("shutdown")
+
+        assert sorted(marked) == ["client-report", "internal"]
+        trigger.assert_called_once_with("internal")
+
     def test_one_job_marking_failure_does_not_block_the_others(self):
         """mark_job_run raising for one job (e.g. a jobs.json write race)
         must not prevent the rest from being marked -- this runs during

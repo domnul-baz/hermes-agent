@@ -283,7 +283,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    get_job,
+    heartbeat_run_claim,
+    mark_job_run,
+    save_job_output,
+    trigger_job,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -405,6 +414,20 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     for job_id in job_ids:
         try:
             mark_job_run(job_id, False, reason)
+            job = get_job(job_id)
+            if job and job.get("retry_on_interruption") is True:
+                # Explicit opt-in only.  ``mark_job_run`` advances recurring
+                # jobs to their ordinary next window; trigger_job moves an
+                # opted-in internal job back to the next scheduler tick so a
+                # gateway outage cannot silently cost an entire week.
+                try:
+                    trigger_job(job_id)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to schedule interrupted job %s for retry: %s",
+                        job_id,
+                        e,
+                    )
             marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
