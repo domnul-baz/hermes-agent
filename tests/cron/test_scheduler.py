@@ -1649,6 +1649,7 @@ error: failed to push some refs to 'github.com:dobrician/aibaza-ops.git'"""
     def test_failed_job_delivers_incident_message_without_wrapper(self):
         incident = {"ok": True, "action": "created", "id": 42, "occurrences": 1}
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.claim_job_for_fire", return_value=True), \
              patch("cron.scheduler.run_job", return_value=(False, "# output", "", "You've hit your weekly limit")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler.report_cron_failure_incident", return_value=incident), \

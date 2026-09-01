@@ -17,6 +17,7 @@ def _adapter_with_channel():
     adapter._client = client
     adapter._allowed_user_ids = set()
     adapter._allowed_role_ids = set()
+    adapter.config = SimpleNamespace(extra=None)
     adapter._nonconversational_messages = SimpleNamespace(mark_many=lambda _ids: None)
     return adapter, channel
 
