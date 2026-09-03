@@ -791,6 +791,66 @@ class TestTerminalOutputRedaction:
         assert not is_env_dump_command("")
         assert not is_env_dump_command(None)
 
+    def test_process_environment_inspection_grammar(self):
+        from agent.redact import is_process_environment_inspection
+
+        for command in (
+            "ps e", "ps eww", "ps axe", "ps auxe", "/bin/ps eww",
+            "ps -p 123 e", "ps ewwo args", "ps -E",
+            "cat /proc/123/environ", "tr '\\0' '\\n' </proc/self/environ",
+            "cat /proc/123/task/456/environ | sort",
+            "strings /proc/thread-self/environ",
+            "cat /proc/*/environ", "cat /proc/$$/environ",
+            "cat /proc/$PID/environ", "cat /proc/${PID}/environ",
+            "cat /proc/$pid/environ", "cat /proc/${worker_pid}/environ",
+            "cat /proc/*/task/*/environ",
+            "cat /proc/$PID/task/${PID}/environ",
+            "cat /proc/$pid/task/${tid}/environ",
+        ):
+            assert is_process_environment_inspection(command), command
+
+        for command in (
+            "ps -e", "ps -ef", "ps aux", "ps -eo pid,args",
+            "ps -o pid,args", "ps -u dcuser", "ps -C nginx",
+            "ps -eo etime", "ps -eo user", "ps -Ao user",
+            "ps h -eo etime", "ps -fp 1234",
+            "ps -O etime", "ps -s e", "ps -eO etime", "ps -es e",
+            "ps o e", "ps U e",
+            "ps --sort=-etime", "pgrep nginx", "pidof nginx",
+            "cat /proc/123/status", "cat /proc/*/status",
+            "cat /proc/$$/meminfo", "cat /proc/$PID/task/${PID}/status",
+        ):
+            assert not is_process_environment_inspection(command), command
+
+    def test_ps_env_dump_with_url_masks_upper_and_lowercase_opaque_values(self):
+        from agent.redact import redact_terminal_output
+
+        output = (
+            "3688528 ? S 0:00 worker SERVICE_TOKEN=FAKE_UPPER_VALUE_12345 "
+            "service_secret=fake_lower_value_67890 "
+            "PUBLIC_URL=https://example.invalid/path\n"
+        )
+        redacted = redact_terminal_output(
+            output, "ps eww -p 3688528 -o pid=,etime=,args="
+        )
+
+        assert "FAKE_UPPER_VALUE_12345" not in redacted
+        assert "fake_lower_value_67890" not in redacted
+        assert "https://example.invalid/path" in redacted
+
+    def test_proc_environ_read_masks_opaque_value(self):
+        from agent.redact import redact_terminal_output
+
+        redacted = redact_terminal_output(
+            "service_token=fake_proc_value_24680\x00HOME=/tmp",
+            "xargs -0 -L1 </proc/123/task/456/environ",
+        )
+        assert "fake_proc_value_24680" not in redacted
+
+    def test_ordinary_url_passthrough_remains_unchanged(self):
+        text = "https://example.invalid/callback?token=fake_round_trip_value"
+        assert redact_sensitive_text(text, force=True) == text
+
     # ── .env file detection (issue #61352 v2) ──
 
     def test_command_reads_env_file_detection(self):
@@ -860,6 +920,17 @@ class TestTerminalOutputRedaction:
         out = "     1\tMISTRAL_API_KEY=abc123opaqueSecretValue\n"
         red = redact_terminal_output(out, "cat -n .env")
         assert "abc123opaqueSecretValue" not in red
+
+    def test_cat_env_file_with_url_masks_lowercase_opaque_token(self):
+        from agent.redact import redact_terminal_output
+
+        out = (
+            "service_secret=fake_lowercase_opaque_value_13579\n"
+            "PUBLIC_URL=https://example.invalid/path\n"
+        )
+        red = redact_terminal_output(out, "cat .env")
+        assert "fake_lowercase_opaque_value_13579" not in red
+        assert "https://example.invalid/path" in red
 
     def test_cat_env_file_in_pipeline_masks_opaque_token(self):
         """cat .env | grep KEY → still detected as .env read."""

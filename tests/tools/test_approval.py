@@ -537,6 +537,45 @@ class TestProjectSensitiveTeePattern:
         assert "project env/config" in desc.lower()
 
 
+class TestProcessEnvironmentInspection:
+    def test_environment_inspection_requires_approval(self):
+        expected = "process environment inspection exposes credentials"
+        for command in (
+            "ps eww -p 123 -o pid=,args=",
+            "/usr/bin/ps -E",
+            "cat /proc/self/environ",
+            "tr '\\0' '\\n' </proc/123/task/456/environ | sort",
+            "cat /proc/*/environ", "cat /proc/$$/environ",
+            "cat /proc/$PID/environ", "cat /proc/${PID}/environ",
+            "cat /proc/$pid/environ", "cat /proc/${worker_pid}/environ",
+            "cat /proc/*/task/*/environ",
+            "cat /proc/$PID/task/${PID}/environ",
+            "cat /proc/$pid/task/${tid}/environ",
+        ):
+            assert detect_dangerous_command(command) == (True, expected, expected)
+
+    def test_ordinary_process_inspection_stays_clean(self):
+        for command in (
+            "ps -ef", "ps aux", "ps -eo pid,args", "ps -o pid,args",
+            "ps -u dcuser", "ps -C nginx", "ps o e", "ps U e",
+            "ps -eo etime", "ps -eo user", "ps -Ao user",
+            "ps h -eo etime", "ps -fp 1234",
+            "ps -O etime", "ps -s e", "ps -eO etime", "ps -es e",
+            "ps --sort=-etime",
+            "pgrep nginx", "pidof nginx", "cat /proc/123/status",
+            "cat /proc/*/status", "cat /proc/$$/meminfo",
+            "cat /proc/$PID/task/${PID}/status",
+        ):
+            assert detect_dangerous_command(command) == (False, None, None), command
+
+    def test_existing_dangerous_reason_wins_for_compound_command(self):
+        dangerous, _, description = detect_dangerous_command(
+            "rm -rf /tmp/synthetic-review-target && ps eww"
+        )
+        assert dangerous is True
+        assert description == "delete in root path"
+
+
 class TestPatternKeyUniqueness:
     """Bug: pattern_key is derived by splitting on \\b and taking [1], so
     patterns starting with the same word (e.g. find -exec rm and find -delete)

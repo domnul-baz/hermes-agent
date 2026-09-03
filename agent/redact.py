@@ -778,6 +778,7 @@ def redact_sensitive_text(
     code_file: bool = False,
     file_read: bool = False,
     redact_url_credentials: bool = False,
+    env_dump: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -795,6 +796,11 @@ def redact_sensitive_text(
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
     constants, "apiKey": "test" fixtures). Prefix patterns, auth headers,
     private keys, DB connstrings, JWTs, and URL secrets are still redacted.
+
+    Set env_dump=True when the whole text is known to contain process
+    environment output. This keeps assignment redaction active even when an
+    unrelated environment value contains ``://``; ordinary URL passthrough is
+    unchanged for all other callers.
 
     Set file_read=True for file *content* returned to the agent (read_file /
     search_files / cat). Secrets are STILL redacted — they are never exposed —
@@ -867,7 +873,7 @@ def redact_sensitive_text(
             # function; _redact_strict_url_credentials handles the opt-in
             # case). The uppercase regex above is all-caps-only, so it never
             # matches URL params; the lowercase one would (issue #77484).
-            if "://" not in text:
+            if env_dump or "://" not in text:
                 text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -881,7 +887,7 @@ def redact_sensitive_text(
             # (e.g. base64/hex blobs in compaction payloads); the linear
             # keyword scan prevents that pathological path on secret-free
             # text.
-            if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
+            if (env_dump or "://" not in text) and _CFG_SECRET_WORD_RE.search(text):
                 text = _CFG_DOTTED_RE.sub(_redact_env, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
@@ -1018,6 +1024,62 @@ def redact_sensitive_text(
 # fixtures, ``postgresql://{user}`` f-string templates). See issue #43025.
 _ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
 
+_PS_VALUE_OPTIONS = frozenset({
+    "-C", "-G", "-g", "-O", "-o", "-p", "-q", "-s", "-t", "-U", "-u",
+    "--format", "--group", "--Group", "--pid", "--ppid", "--quick-pid",
+    "--sid", "--sort", "--tty", "--user", "--User",
+})
+_PS_SHORT_OPTIONS_REQUIRING_OPERAND = frozenset("CGgOopqstUu")
+_PS_BSD_VALUE_OPTIONS = frozenset({"G", "O", "U", "o", "p", "q", "t"})
+_PROC_PID_PATH_FRAGMENT = (
+    r"(?:[0-9]+|self|thread-self|\*|\$\$|"
+    r"\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})"
+)
+_PROC_ENVIRON_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.-])/proc/{_PROC_PID_PATH_FRAGMENT}/"
+    rf"(?:task/{_PROC_PID_PATH_FRAGMENT}/)?environ(?=$|[\s'\"|;&<>])"
+)
+
+
+def is_process_environment_inspection(command: str | None) -> bool:
+    """Return True when a command reads another process's environment."""
+    if not command or not isinstance(command, str):
+        return False
+    if _PROC_ENVIRON_RE.search(command):
+        return True
+
+    for segment in re.split(r"[|;&]+", command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        if not tokens or os.path.basename(tokens[0]) != "ps":
+            continue
+
+        skip_value = False
+        for token in tokens[1:]:
+            if skip_value:
+                skip_value = False
+                continue
+            if token == "-E":
+                return True
+            if token in _PS_VALUE_OPTIONS:
+                skip_value = True
+                continue
+            if token.startswith("--"):
+                continue
+            if token.startswith("-"):
+                if len(token) > 2 and token[-1] in _PS_SHORT_OPTIONS_REQUIRING_OPERAND:
+                    skip_value = True
+                continue
+            # BSD ps accepts option clusters without a dash. In that grammar
+            # lower-case ``e`` means include the process environment.
+            if token.isalpha() and "e" in token:
+                return True
+            if token.isalpha() and any(opt in token for opt in _PS_BSD_VALUE_OPTIONS):
+                skip_value = True
+    return False
+
 # Commands that read file contents to stdout. When the target is a ``.env``
 # file, the output is a credential dump — the same as ``printenv`` — so the
 # ENV-assignment pass must run (code_file=False). Per AGENTS.md, ``.env`` is
@@ -1085,6 +1147,8 @@ def is_env_dump_command(command: str | None) -> bool:
     """
     if not command or not isinstance(command, str):
         return False
+    if is_process_environment_inspection(command):
+        return True
     # Split on shell separators, then inspect the first token of each segment.
     segments = re.split(r"[|;&]+", command)
     for seg in segments:
@@ -1126,8 +1190,11 @@ def redact_terminal_output(
     if not output:
         return output
     cmd = command or ""
-    code_file = not (is_env_dump_command(cmd) or _command_reads_env_file(cmd))
-    return redact_sensitive_text(output, force=force, code_file=code_file)
+    env_dump = is_env_dump_command(cmd) or _command_reads_env_file(cmd)
+    code_file = not env_dump
+    return redact_sensitive_text(
+        output, force=force, code_file=code_file, env_dump=env_dump
+    )
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in

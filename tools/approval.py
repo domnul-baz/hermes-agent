@@ -2522,6 +2522,11 @@ def detect_dangerous_command(command: str) -> tuple:
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)
+    from agent.redact import is_process_environment_inspection
+
+    if is_process_environment_inspection(command):
+        description = "process environment inspection exposes credentials"
+        return (True, description, description)
     if _is_shell_token_spliced_gateway_lifecycle(command):
         return (
             True,
