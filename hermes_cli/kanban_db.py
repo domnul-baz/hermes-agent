@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -4487,6 +4487,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    ended_at: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4497,7 +4498,7 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
-    now = int(time.time())
+    now = int(time.time()) if ended_at is None else int(ended_at)
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -4532,6 +4533,10 @@ def _end_run(
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
+    # Deliberately do not touch the managed-process registry here.  Normal
+    # complete/block calls execute in the worker subprocess, while the strong
+    # Popen reference belongs to the long-lived dispatcher process.  The
+    # dispatcher drops it on a later tick after observing this durable row.
     return run_id
 
 
@@ -8287,8 +8292,7 @@ class DispatchResult:
     deferred tasks stay queued for the next tick."""
 
 
-# Bounded registry of recently-reaped worker child exits, populated by the
-# reap loop at the top of ``dispatch_once`` and consulted by
+# Bounded legacy registry of explicit raw worker exits, consulted by
 # ``detect_crashed_workers`` to classify a dead-pid task.
 #
 # Entry: ``pid -> (raw_wait_status, reaped_at_epoch)``. We keep raw status
@@ -8298,32 +8302,167 @@ class DispatchResult:
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+# Managed workers are owned by exactly one daemon observer.  In particular we
+# must not use waitpid(-1): it can consume an unrelated Popen's status and race
+# its owner.  The retained Popen is also the authoritative return-code source.
+@dataclass
+class _ManagedWorkerObservation:
+    proc: Any
+    task_id: Optional[str] = None
+    run_id: Optional[int] = None
+    board_db_path: Optional[str] = None
+    exited: Any = field(default_factory=threading.Event)
+    returncode: Optional[int] = None
+    observed_at: Optional[float] = None
+    reported: bool = False
+
+
+_managed_worker_processes: "dict[int, _ManagedWorkerObservation]" = {}
+_worker_exit_registry_lock = threading.RLock()
+_MANAGED_WORKER_OBSERVATION_WAIT_SECONDS = 0.05
+# Narrow clock seams make observer/detector timing testable without changing
+# process-global time.time (which other threads and SQLite event helpers use).
+_worker_exit_observation_clock: Callable[[], float] = time.time
+_worker_exit_detection_clock: Callable[[], float] = time.time
+
+
+def _prune_recent_worker_exits(
+    now: Optional[float] = None, *, enforce_max: bool = False,
+) -> None:
+    """Keep the legacy raw-wait-status fallback strictly TTL/size bounded.
+
+    Caller holds ``_worker_exit_registry_lock``.
+    """
+    now = time.time() if now is None else now
+    cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+    for stale_pid in [p for p, (_status, seen) in _recent_worker_exits.items() if seen < cutoff]:
+        _recent_worker_exits.pop(stale_pid, None)
+    if enforce_max and len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
+        ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
+        for stale_pid, _ in ordered[: len(ordered) // 2]:
+            _recent_worker_exits.pop(stale_pid, None)
+
+
+def _remember_managed_worker_process(
+    proc: Any, *, task_id: Optional[str] = None, run_id: Optional[int] = None,
+    board_db_path: Optional[str] = None,
+) -> None:
+    """Retain *proc* and give its exact Popen one wait-owning observer."""
+    try:
+        pid = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        return
+    if pid <= 0:
+        return
+    # A pid alone is not a process contract, and a pid-bearing test double is
+    # not a Popen.  Only retain an object whose exact waiter we can own.
+    if not callable(getattr(proc, "wait", None)):
+        return
+    observation = _ManagedWorkerObservation(
+        proc=proc, task_id=task_id, run_id=run_id,
+        board_db_path=board_db_path,
+    )
+    with _worker_exit_registry_lock:
+        _managed_worker_processes[pid] = observation
+
+    def observe() -> None:
+        returncode = None
+        try:
+            returncode = proc.wait()
+        except Exception:
+            pass
+        finally:
+            observed_at = _worker_exit_observation_clock()
+            with _worker_exit_registry_lock:
+                current = _managed_worker_processes.get(pid)
+                if current is observation:
+                    # Popen.wait() sets returncode itself; save that canonical
+                    # value rather than reconstructing it from a raw wait status.
+                    current.returncode = getattr(proc, "returncode", None)
+                    if current.returncode is None:
+                        current.returncode = returncode
+                    current.observed_at = observed_at
+                    current.exited.set()
+
+    threading.Thread(target=observe, name=f"kanban-worker-{pid}", daemon=True).start()
+
+
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the canonical path of *conn*'s SQLite ``main`` database."""
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            if row[1] == "main" and row[2]:
+                return str(Path(row[2]).resolve())
+    except sqlite3.DatabaseError:
+        pass
+    return None
+
+
+def _cleanup_managed_worker_processes(conn: sqlite3.Connection) -> list[int]:
+    """Forget exited workers after an exact, same-board terminal run check."""
+    board_db_path = _connection_main_db_path(conn)
+    if board_db_path is None:
+        return []
+    now = _worker_exit_observation_clock()
+    with _worker_exit_registry_lock:
+        candidates = [
+            (pid, item.task_id, item.run_id, item.observed_at)
+            for pid, item in _managed_worker_processes.items()
+            if (item.exited.is_set() and item.task_id is not None
+                and item.run_id is not None and item.board_db_path == board_db_path)
+        ]
+    forgotten: list[int] = []
+    for pid, task_id, run_id, observed_at in candidates:
+        row = conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        terminal = row is not None and row["ended_at"] is not None
+        missing_expired = (
+            row is None and observed_at is not None
+            and now - observed_at >= _RECENT_WORKER_EXIT_TTL_SECONDS
+        )
+        if terminal or missing_expired:
+            with _worker_exit_registry_lock:
+                item = _managed_worker_processes.get(pid)
+                if (
+                    item is not None and item.exited.is_set()
+                    and item.board_db_path == board_db_path
+                    and item.run_id == run_id and item.task_id == task_id
+                ):
+                    _managed_worker_processes.pop(pid, None)
+                    forgotten.append(pid)
+    with _worker_exit_registry_lock:
+        _prune_recent_worker_exits()
+    return forgotten
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
-    Called from the reap loop in ``dispatch_once``. Safe to call many
-    times; duplicate pids overwrite (pids can cycle, latest wins).
+    Backward-compatible test/legacy fallback. Production managed workers are
+    recorded by their exact Popen observer instead. Safe to call many times;
+    duplicate pids overwrite (pids can cycle, latest wins).
     """
     if not pid or pid <= 0:
         return
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(raw_status), now)
-    # Age-based trim: drop entries older than the TTL.
-    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
-        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
-        for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
-            _recent_worker_exits.pop(_pid, None)
-    # Size cap as a final guard.
-    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
-        # Drop oldest half.
-        ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
-        for _pid, _ in ordered[: len(ordered) // 2]:
-            _recent_worker_exits.pop(_pid, None)
+    with _worker_exit_registry_lock:
+        _recent_worker_exits[int(pid)] = (int(raw_status), now)
+        # Preserve the legacy fallback's opportunistic trim cadence.  In
+        # particular, don't sort a large registry on every worker exit.
+        if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
+            _prune_recent_worker_exits(now, enforce_max=True)
+            # A clock seam (or a wall-clock adjustment) can make the just
+            # recorded entry sort as "old". A fresh explicit wait status must
+            # never evict itself before its first classification.
+            _recent_worker_exits[int(pid)] = (int(raw_status), now)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def _classify_worker_exit(
+    pid: int, *, board_db_path: Optional[str] = None,
+    task_id: Optional[str] = None, run_id: Optional[int] = None,
+) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
     Returns ``(kind, code)`` where ``kind`` is one of:
@@ -8339,15 +8478,37 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       counting a failure, so a long quota window can't trip the breaker.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
-    * ``"unknown"`` — pid was not in the reap registry (either reaped by
-      something else, or died between reap tick and liveness check). Fall
-      back to existing crashed-counter behavior.
+    * ``"unknown"`` — no managed observer or legacy raw-status fallback was
+      available. Fall back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
     """
-    entry = _recent_worker_exits.get(int(pid))
+    with _worker_exit_registry_lock:
+        # Explicit legacy records are compatibility/test input.  They win over
+        # a coincident retained Popen pid: a recycled pid must not let an
+        # unrelated observer rewrite a supplied raw wait status.
+        entry = _recent_worker_exits.get(int(pid))
+        if entry is None:
+            managed = _managed_worker_processes.get(int(pid))
+        else:
+            managed = None
+        if (
+            managed is not None and managed.exited.is_set()
+            and managed.returncode is not None
+            and (board_db_path is None or managed.board_db_path == board_db_path)
+            and (task_id is None or managed.task_id == task_id)
+            and (run_id is None or managed.run_id == run_id)
+        ):
+            rc = managed.returncode
+            if rc == 0:
+                return ("clean_exit", 0)
+            if rc == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", rc)
+            if rc < 0:
+                return ("signaled", -rc)
+            return ("nonzero_exit", rc)
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
@@ -8366,27 +8527,43 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
-def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children of this process without blocking.
+def _worker_exit_observed_at(
+    pid: int, *, board_db_path: Optional[str] = None,
+    task_id: Optional[str] = None, run_id: Optional[int] = None,
+) -> Optional[float]:
+    """Return when this process observed *pid* exit, if its raw status is cached."""
+    with _worker_exit_registry_lock:
+        managed = _managed_worker_processes.get(int(pid))
+        if (
+            managed is not None and managed.exited.is_set()
+            and (board_db_path is None or managed.board_db_path == board_db_path)
+            and (task_id is None or managed.task_id == task_id)
+            and (run_id is None or managed.run_id == run_id)
+        ):
+            return managed.observed_at
+        entry = _recent_worker_exits.get(int(pid))
+    return entry[1] if entry is not None else None
 
-    Returns the list of reaped PIDs. Safe to call when there are no
-    children (returns []). No-op on Windows.
-    """
-    reaped: "list[int]" = []
-    if os.name != "nt":
-        try:
-            while True:
-                try:
-                    pid, status = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    break
-                if pid == 0:
-                    break
-                _record_worker_exit(pid, status)
+
+def _await_managed_worker_observation(pid: int) -> None:
+    """Give the sole Popen waiter a brief chance to publish a dead worker."""
+    with _worker_exit_registry_lock:
+        managed = _managed_worker_processes.get(int(pid))
+        exited = managed.exited if managed is not None else None
+    if exited is not None and not exited.is_set():
+        exited.wait(_MANAGED_WORKER_OBSERVATION_WAIT_SECONDS)
+
+
+def reap_worker_zombies() -> "list[int]":
+    """Return each observer-reaped managed PID once; never calls ``waitpid``."""
+    with _worker_exit_registry_lock:
+        _prune_recent_worker_exits()
+        reaped = []
+        for pid, item in _managed_worker_processes.items():
+            if item.exited.is_set() and item.returncode is not None and not item.reported:
+                item.reported = True
                 reaped.append(pid)
-        except Exception:
-            pass
-    return reaped
+        return reaped
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -8404,10 +8581,9 @@ def _pid_alive(pid: Optional[int]) -> bool:
     **Zombie handling:** the existence check succeeds against zombie
     processes (post-exit, pre-reap) because the process table entry
     still exists. A worker that exits without being reaped by its
-    parent would stay "alive" to the dispatcher forever. Dispatcher
-    workers are started via ``start_new_session=True`` + intentional
-    Popen handle abandonment, so init reaps them quickly — but during
-    the window between exit and reap, we'd otherwise see stale "alive"
+    parent would stay "alive" to the dispatcher forever. The dispatcher
+    retains each worker's ``Popen`` and an exact observer reaps it; during
+    the window before that observation, we'd otherwise see stale "alive"
     signals. On Linux we peek at ``/proc/<pid>/status`` and treat
     ``State: Z`` as dead. On macOS we ask ``ps`` for the BSD ``stat``
     field and treat values containing ``Z`` as dead.
@@ -9065,14 +9241,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``_default_spawn`` always runs the worker on the same host as the
     dispatcher (the whole design is single-host).
 
-    When the reap registry shows the worker exited cleanly (rc=0) but
+    When the managed observer shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
     ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
     on the first occurrence — retrying a worker whose CLI keeps
     returning 0 without a terminal transition just loops forever.
 
-    When the reap registry shows the worker exited with the rate-limit
+    When the managed observer shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
     provider quota wall, NOT a task failure. Such tasks are released back
     to its source phase WITHOUT counting a failure (so a long quota window can't
@@ -9094,11 +9270,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    board_db_path = _connection_main_db_path(conn)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.current_run_id, t.worker_pid, t.claim_lock, t.assignee, "
+            "       COALESCE(r.started_at, t.started_at) AS run_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -9109,16 +9288,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
+            started_at = row["run_started_at"]
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
+                if _worker_exit_detection_clock() - started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            # A child can be dead just before its observer thread gets CPU.
+            # Wait only for that exact observer; do not become a competing
+            # waiter and do not delay checks for unmanaged/legacy PIDs.
+            _await_managed_worker_observation(pid)
+            kind, code = _classify_worker_exit(
+                pid, board_db_path=board_db_path, task_id=row["id"],
+                run_id=row["current_run_id"],
+            )
+            exit_observed_at = _worker_exit_observed_at(
+                pid, board_db_path=board_db_path, task_id=row["id"],
+                run_id=row["current_run_id"],
+            )
+            detected_at = _worker_exit_detection_clock()
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -9141,6 +9332,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
+                    "exit_kind": kind,
                     "exit_code": code,
                     # Durable marker for _protocol_violation_streak: _end_run
                     # copies this payload into the run metadata, which is how
@@ -9165,6 +9357,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
+                    "exit_kind": kind,
                     "exit_code": code,
                 }
             else:
@@ -9176,13 +9369,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 else:
                     error_text = f"pid {pid} not alive"
                 event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
+                event_payload = {
+                    "pid": pid, "claimer": row["claim_lock"],
+                    "exit_kind": kind,
+                }
+                if code is not None:
                     event_payload["exit_code"] = code
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            if exit_observed_at is not None:
+                # `ended_at` deliberately remains _end_run's detector-time
+                # timestamp.  Keep the observation and latency separately so
+                # delayed dispatcher ticks are diagnosable without changing
+                # existing lifecycle semantics.
+                event_payload["worker_exit_observed_at"] = exit_observed_at
+                event_payload["detection_latency_seconds"] = max(
+                    0.0, detected_at - exit_observed_at,
+                )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -9200,6 +9404,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
                     metadata=dict(event_payload),
+                    ended_at=detected_at,
                 )
                 _append_event(
                     conn, row["id"], event_kind,
@@ -9350,6 +9555,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 board=_board,
                 **hook_fields,
             )
+    # Crash/rate-limit closure happened in this dispatcher transaction; normal
+    # complete/block closure is visible here on the next tick.  Either way,
+    # only this long-lived process can release its retained Popen handle.
+    _cleanup_managed_worker_processes(conn)
     return crashed
 
 
@@ -10147,9 +10356,9 @@ def _dispatch_once_locked(
     # stale tick cannot kill siblings or leave the board half-reconciled.
     assert_source_run_active(conn, operation="dispatch_once")
 
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
+    # Compatibility surface for old callers; exact Popen observers own waits.
     reap_worker_zombies()
+    _cleanup_managed_worker_processes(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -11026,7 +11235,8 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    board_db_path = str(kanban_db_path(board=board).resolve())
+    env["HERMES_KANBAN_DB"] = board_db_path
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
@@ -11087,13 +11297,13 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
+    # Goal-mode workers require the fully-quiet single-query path because the
+    # kanban goal-loop hook (_run_kanban_goal_loop_q) only runs there.
+    # Both goal and ordinary workers need cli.py's fully-quiet single-query
+    # path.  In particular that path maps provider quota/billing failures to
+    # EX_TEMPFAIL (75), which the detector deliberately treats as a neutral
+    # rate-limited requeue rather than a task failure.
+    cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -11123,11 +11333,12 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    _remember_managed_worker_process(
+        proc, task_id=task.id, run_id=task.current_run_id,
+        board_db_path=board_db_path,
+    )
+    # Keep the log FD open for the inherited child; it remains open there
+    # until the worker exits.
     return proc.pid
 
 
