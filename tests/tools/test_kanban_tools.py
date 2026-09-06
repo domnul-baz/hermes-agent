@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -62,10 +63,12 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -183,10 +186,12 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             conn, title="goal-mode-test", assignee="test-worker",
             body="Must achieve X with verified evidence.", goal_mode=True
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -249,10 +254,12 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
         )
-        kb.claim_task(conn, goal_task_id)
+        claimed = kb.claim_task(conn, goal_task_id)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 
@@ -927,14 +934,13 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     channel. This is the knob that addresses the upstream design
     concern from PR #19718 (reverted in #19721) — users who want
     explicit kanban_notify-subscribe calls per task get that."""
-    # worker_env already created <tmp>/.hermes; use a fresh sibling
-    # home to avoid mkdir() colliding with the worker's directory.
-    home = tmp_path / "gate-home" / ".hermes"
-    home.mkdir(parents=True)
+    # Keep the worker's source task and mutation on the same board. Switching
+    # HERMES_HOME here would correctly trip the source-run fence because the
+    # source task does not exist on that other board.
+    home = Path(os.environ["HERMES_HOME"])
     (home / "config.yaml").write_text(
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
-    monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 

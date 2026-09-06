@@ -70,10 +70,13 @@ def test_seed_then_inject_new_comment(worker_home, monkeypatch):
     try:
         tid = kb.create_task(conn, title="live task")
         kb.add_comment(conn, tid, author="desktop", body="pre-existing note")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
     agent = FakeAgent()
 
@@ -82,11 +85,15 @@ def test_seed_then_inject_new_comment(worker_home, monkeypatch):
     assert kt.inject_new_comments_from_env(agent) is False
     assert agent.steers == []
 
-    conn = kb.connect()
-    try:
-        kb.add_comment(conn, tid, author="desktop", body="actually use the v2 API")
-    finally:
-        conn.close()
+    # Desktop is an operator context, not the running worker.
+    with monkeypatch.context() as operator:
+        operator.delenv("HERMES_KANBAN_TASK", raising=False)
+        operator.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+        conn = kb.connect()
+        try:
+            kb.add_comment(conn, tid, author="desktop", body="actually use the v2 API")
+        finally:
+            conn.close()
 
     _unthrottle()
     assert kt.inject_new_comments_from_env(agent) is True
@@ -103,10 +110,13 @@ def test_skips_own_authored_comments(worker_home, monkeypatch):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="echo guard")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     monkeypatch.setenv("HERMES_PROFILE", "worker-bot")
     agent = FakeAgent()
 

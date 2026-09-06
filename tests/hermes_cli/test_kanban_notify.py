@@ -817,18 +817,21 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     try:
         tid = kb.create_task(conn, title="t", assignee="worker1")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
     finally:
         conn.close()
 
-    import os
-    os.environ["HERMES_KANBAN_TASK"] = tid
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     try:
         kt._handle_complete({
             "summary": "one real, one ghost",
             "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
         })
     finally:
-        os.environ.pop("HERMES_KANBAN_TASK", None)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
