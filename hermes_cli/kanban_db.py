@@ -8189,8 +8189,23 @@ KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 # Respawn guard constants
 # ---------------------------------------------------------------------------
 
+# Workspace failures are deterministic local setup failures, not provider
+# credentials.  Keep this deliberately scoped to the dispatcher-added
+# ``workspace:`` prefix: a generic ``Permission denied`` from a provider or
+# SSH still belongs to the auth blocker below (notably ``publickey``).
+_WORKSPACE_FAILURE_RE = re.compile(
+    r"\bworkspace:\s*(?:"
+    r"\[Errno\s+(?:2|13|20|30)\]\s*"
+    r"(?:No such file or directory|Permission denied|Not a directory|"
+    r"Read-only file system)"
+    r"|.*\b(?:No such file or directory|Not a directory|"
+    r"Read-only file system)\b)",
+    re.IGNORECASE,
+)
+
 # Patterns in last_failure_error that indicate a quota / auth blocker.
-# These errors won't resolve by retrying immediately — auto-block instead.
+# These errors won't resolve by retrying immediately — defer rather than
+# consume another worker attempt.
 _RESPAWN_BLOCKER_RE = re.compile(
     r"\b(quota|rate[\s_\-]?limit|429|403|auth\w*|"
     r"unauthorized|forbidden|billing|subscription|"
@@ -8269,7 +8284,9 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
-    Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
+    Reasons: ``"blocker_workspace"`` (deterministic local workspace error —
+    force-trips the circuit breaker on this tick), ``"blocker_auth"``
+    (quota/auth error),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
@@ -9573,6 +9590,9 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_status: Optional[str] = None,
+    require_unclaimed: bool = False,
+    saturate_failures_to_limit: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -9602,6 +9622,17 @@ def _record_task_failure(
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
 
+    ``expected_status`` and ``require_unclaimed`` optionally fence this
+    accounting transition to the dispatcher snapshot that selected the task.
+    A stale snapshot must not block a task that another worker has since
+    claimed, completed, or otherwise moved.  A failed fenced UPDATE is a
+    no-op: it emits no event, closes no run, and does not change the counter.
+
+    ``saturate_failures_to_limit`` is intentionally opt-in for a forced
+    terminal guard.  It records the resolved effective limit rather than one
+    more observed failure, so dependency recomputation cannot re-promote the
+    card before the ordinary breaker threshold is reached.
+
     Resolution order for the effective threshold:
       1. per-task ``max_retries`` if set (nothing else overrides)
       2. caller-supplied ``failure_limit`` (gateway passes the config
@@ -9615,7 +9646,8 @@ def _record_task_failure(
     — e.g. the clean-exit protocol-violation streak in
     ``detect_crashed_workers``, which resolves the per-task
     ``max_retries`` override against the violation streak itself. The
-    failure is still counted into ``consecutive_failures``.
+    failure is still counted into ``consecutive_failures`` unless the caller
+    explicitly requests saturation.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -9623,10 +9655,14 @@ def _record_task_failure(
     with write_txn(conn):
         _assert_source_run_active(conn, operation="record_task_failure")
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, claim_lock, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if expected_status is not None and row["status"] != expected_status:
+            return False
+        if require_unclaimed and row["claim_lock"] is not None:
             return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -9647,11 +9683,14 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
+        if saturate_failures_to_limit:
+            failures = max(failures, effective_limit)
+
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
@@ -9662,12 +9701,20 @@ def _record_task_failure(
                 # Timeout/crash path: source phase already restored with claim
                 # cleared; just flip to blocked + update
                 # counter fields.
-                conn.execute(
+                sql = (
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
+                    "WHERE id = ? AND status IN ('ready', 'review', 'running')"
                 )
+                params: list[Any] = [failures, error[:500], task_id]
+                if expected_status is not None:
+                    sql += " AND status = ?"
+                    params.append(expected_status)
+                if require_unclaimed:
+                    sql += " AND claim_lock IS NULL"
+                cur = conn.execute(sql, params)
+            if cur.rowcount != 1:
+                return False
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
@@ -9701,7 +9748,7 @@ def _record_task_failure(
             # Below threshold.
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
@@ -9710,11 +9757,19 @@ def _record_task_failure(
                 )
             else:
                 # Timeout/crash path: caller already restored the source phase.
-                conn.execute(
+                sql = (
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    "last_failure_error = ? WHERE id = ?"
                 )
+                params = [failures, error[:500], task_id]
+                if expected_status is not None:
+                    sql += " AND status = ?"
+                    params.append(expected_status)
+                if require_unclaimed:
+                    sql += " AND claim_lock IS NULL"
+                cur = conn.execute(sql, params)
+            if cur.rowcount != 1:
+                return False
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
@@ -9831,6 +9886,11 @@ def check_respawn_guard(
         never increments ``consecutive_failures``, so the breaker can't free
         it). Once the cooldown elapses the task falls through and respawns.
 
+    ``"blocker_workspace"``
+        The prior workspace-resolution attempt hit a deterministic local
+        filesystem failure. The dispatcher force-trips the existing failure
+        circuit breaker without resolving/spawning a second time.
+
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
@@ -9903,8 +9963,15 @@ def check_respawn_guard(
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Deterministic local workspace failures must not be mistaken for
+    #    provider auth failures. The dispatcher consumes this distinct guard
+    #    by force-tripping the normal circuit breaker; it never retries
+    #    workspace resolution.
     err = row["last_failure_error"]
+    if err and _WORKSPACE_FAILURE_RE.search(err):
+        return "blocker_workspace"
+
+    # 3. Quota / auth blocker: retrying immediately will not help.
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
@@ -9914,7 +9981,7 @@ def check_respawn_guard(
     if lane == "review":
         return None
 
-    # 3. Completed run within guard window — proof of recent success.
+    # 4. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
     #    reclaim) is a deliberate "run it again" — honor it instead of
@@ -9939,7 +10006,7 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 5. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
@@ -9949,6 +10016,42 @@ def check_respawn_guard(
             return "active_pr"
 
     return None
+
+
+def _trip_workspace_respawn_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    failure_limit: int,
+    expected_status: str,
+) -> bool:
+    """Trip the normal breaker for a prior local workspace failure.
+
+    The original attempt already closed its run as ``spawn_failed`` and
+    restored the task to its source phase.  On the following tick we do not
+    claim it again: force the existing task-failure path to transition that
+    *same unclaimed source phase* to ``blocked`` and emit its compatible
+    ``gave_up`` event.  The expected phase is a CAS fence against the
+    dispatch snapshot: if an earlier spawn in this tick claimed or completed
+    the task, this returns False without changing it.  Once blocked,
+    subsequent ticks cannot enter this path, making it idempotent.
+    """
+    row = conn.execute(
+        "SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    error = (row["last_failure_error"] if row else None) or "workspace resolution failed"
+    return _record_task_failure(
+        conn,
+        task_id,
+        error,
+        outcome="spawn_failed",
+        failure_limit=failure_limit,
+        force_trip=True,
+        saturate_failures_to_limit=True,
+        event_payload_extra={"failure_class": "workspace"},
+        expected_status=expected_status,
+        require_unclaimed=True,
+    )
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -10619,9 +10722,20 @@ def _dispatch_once_locked(
         # the task gets a chance to clear (rate limits often reset in
         # seconds-to-minutes); the existing consecutive_failures counter
         # still trips the auto-block circuit breaker after failure_limit
-        # consecutive failures, so a persistent auth error eventually
-        # blocks via the normal path rather than on first occurrence.
+        # consecutive failures remain intact while the guard defers a
+        # persistent auth/quota blocker for operator intervention.
         guard_reason = check_respawn_guard(conn, row["id"])
+        if guard_reason == "blocker_workspace":
+            if dry_run:
+                result.respawn_guarded.append((row["id"], guard_reason))
+            elif _trip_workspace_respawn_guard(
+                conn,
+                row["id"],
+                failure_limit=failure_limit,
+                expected_status="ready",
+            ):
+                result.auto_blocked.append(row["id"])
+            continue
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was
@@ -10756,6 +10870,17 @@ def _dispatch_once_locked(
                 )
                 continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
+        if guard_reason == "blocker_workspace":
+            if dry_run:
+                result.respawn_guarded.append((row["id"], guard_reason))
+            elif _trip_workspace_respawn_guard(
+                conn,
+                row["id"],
+                failure_limit=failure_limit,
+                expected_status="review",
+            ):
+                result.auto_blocked.append(row["id"])
+            continue
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:

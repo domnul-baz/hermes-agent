@@ -367,6 +367,236 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_workspace_failure_force_trips_breaker_without_second_resolution(
+    kanban_home, monkeypatch,
+):
+    """A local workspace error blocks on the next tick, without a retry."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    resolve_calls: list[str] = []
+    spawn_calls: list[str] = []
+
+    def fail_workspace(task, *, board=None):
+        resolve_calls.append(task.id)
+        raise PermissionError(13, "Permission denied", "/root/x")
+
+    def spawn(task, workspace):
+        spawn_calls.append(task.id)
+        return None
+
+    monkeypatch.setattr(kb, "resolve_workspace", fail_workspace)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="local workspace", assignee="worker")
+
+        first = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=5)
+        assert not first.auto_blocked
+        assert resolve_calls == [tid]
+        assert not spawn_calls
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+        assert task.last_failure_error == "workspace: [Errno 13] Permission denied: '/root/x'"
+
+        second = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=5)
+        assert second.auto_blocked == [tid]
+        assert not second.respawn_guarded
+        assert resolve_calls == [tid], "must not resolve the broken workspace again"
+        assert not spawn_calls
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 5
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"][-1]
+        assert gave_up.payload["failures"] == 5
+        assert gave_up.payload["effective_limit"] == 5
+        assert gave_up.payload["trigger_outcome"] == "spawn_failed"
+        assert gave_up.payload["failure_class"] == "workspace"
+        assert kb.latest_run(conn, tid).outcome == "spawn_failed"
+
+        gave_up_count = len([e for e in kb.list_events(conn, tid) if e.kind == "gave_up"])
+        assert kb.recompute_ready(conn, failure_limit=5) == 0
+        third = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=5)
+        assert not third.auto_blocked
+        assert resolve_calls == [tid]
+        assert not spawn_calls
+        assert len([e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]) == gave_up_count
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_workspace_failure_review_guard_preserves_counter_above_task_limit(
+    kanban_home, monkeypatch,
+):
+    """Workspace guards never lower an already over-limit failure counter."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    resolve_calls: list[str] = []
+    spawn_calls: list[str] = []
+    monkeypatch.setattr(
+        kb,
+        "resolve_workspace",
+        lambda task, *, board=None: resolve_calls.append(task.id),
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review workspace", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='review', max_retries=3, "
+            "consecutive_failures=5, last_failure_error=? WHERE id=?",
+            ("workspace: [Errno 13] Permission denied: '/root/x'", tid),
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id),
+            failure_limit=5,
+        )
+
+        assert result.auto_blocked == [tid]
+        assert not resolve_calls
+        assert not spawn_calls
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 6
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"][-1]
+        assert gave_up.payload["failures"] == 6
+        assert gave_up.payload["effective_limit"] == 3
+        assert gave_up.payload["limit_source"] == "task"
+        assert gave_up.payload["retry_status"] == "review"
+
+
+def test_workspace_failure_dry_run_is_guarded_without_mutation(kanban_home, monkeypatch):
+    """Dry-run reports the workspace guard but leaves its breaker untouched."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dry workspace", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1, last_failure_error=? WHERE id=?",
+            ("workspace: [Errno 13] Permission denied: '/root/x'", tid),
+        )
+        conn.commit()
+        event_count = len(kb.list_events(conn, tid))
+
+        result = kb.dispatch_once(conn, dry_run=True, failure_limit=5)
+
+        assert result.respawn_guarded == [(tid, "blocker_workspace")]
+        assert not result.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+        assert len(kb.list_events(conn, tid)) == event_count
+
+
+@pytest.mark.parametrize("source_status", ["ready", "review"])
+@pytest.mark.parametrize("complete_later", [False, True])
+def test_workspace_guard_does_not_clobber_task_changed_mid_tick(
+    kanban_home, monkeypatch, source_status, complete_later,
+):
+    """A stale ready/review snapshot cannot block another worker's claim."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    with kb.connect() as conn:
+        earlier = kb.create_task(
+            conn, title="first", assignee="worker", priority=1,
+        )
+        later = kb.create_task(
+            conn, title="workspace later", assignee="worker",
+        )
+        conn.execute(
+            "UPDATE tasks SET status=?, consecutive_failures=1, last_failure_error=? "
+            "WHERE id=?",
+            (
+                source_status,
+                "workspace: [Errno 13] Permission denied: '/root/x'",
+                later,
+            ),
+        )
+        conn.commit()
+
+        def spawn(task, workspace):
+            assert task.id == earlier
+            claimed = (
+                kb.claim_task(conn, later)
+                if source_status == "ready"
+                else kb.claim_review_task(conn, later)
+            )
+            assert claimed is not None
+            if complete_later:
+                assert kb.complete_task(conn, later, result="done elsewhere")
+            return None
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn, failure_limit=5)
+
+        assert later not in result.auto_blocked
+        assert not [event for event in kb.list_events(conn, later) if event.kind == "gave_up"]
+        task = kb.get_task(conn, later)
+        assert task.status == ("done" if complete_later else "running")
+        if not complete_later:
+            assert task.consecutive_failures == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["401 unauthorized", "workspace: Permission denied (publickey)"],
+)
+def test_auth_failures_remain_respawn_guarded(kanban_home, monkeypatch, error):
+    """Provider auth and SSH public-key failures are not workspace blockers."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    monkeypatch.setattr(
+        kb, "resolve_workspace",
+        lambda *_args, **_kwargs: pytest.fail("guarded task must not resolve workspace"),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="auth", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1, last_failure_error=? WHERE id=?",
+            (error, tid),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) == "blocker_auth"
+        result = kb.dispatch_once(conn)
+        assert result.respawn_guarded == [(tid, "blocker_auth")]
+        assert not result.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+
+def test_nonspawnable_lane_stays_skipped_before_workspace_guard(
+    kanban_home, monkeypatch,
+):
+    """External/control-plane lanes retain their existing no-spawn behavior."""
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="external", assignee="orion-cc")
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1, last_failure_error=? WHERE id=?",
+            ("workspace: [Errno 13] Permission denied: '/root/x'", tid),
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(conn)
+        assert result.skipped_nonspawnable == [tid]
+        assert not result.auto_blocked
+        assert not result.respawn_guarded
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+
+
 
 
 
