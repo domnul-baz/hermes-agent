@@ -1276,7 +1276,7 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         logger.debug("Successfully refreshed Claude Code OAuth token")
         return refreshed["access_token"]
     except Exception as e:
-        logger.debug("Failed to refresh Claude Code token: %s", e)
+        logger.warning("Failed to refresh Claude Code OAuth token (%s); Anthropic runs will be blocked until the claude CLI refreshes ~/.claude/.credentials.json", e)
         return None
 
 

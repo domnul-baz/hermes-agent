@@ -12675,11 +12675,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _faulthandler_path = os.path.join(_log_dir, "gateway_faulthandler.log")
                 os.makedirs(_log_dir, exist_ok=True)
                 _fh = open(_faulthandler_path, "a", encoding="utf-8")
+                # chain=False: SIGUSR2 has no prior Python handler, so chaining
+                # falls through to SIG_DFL (terminate). 2026-09-16 16:36Z the
+                # gateway died exactly this way right after writing the dump.
                 faulthandler.register(
                     _sigusr2,
                     file=_fh,
                     all_threads=True,
-                    chain=True,
+                    chain=False,
                 )
             except Exception:
                 logger.debug("Could not set up faulthandler file logging", exc_info=True)
