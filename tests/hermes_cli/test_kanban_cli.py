@@ -116,6 +116,61 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     assert beta_titles == ["beta-task"]
 
 
+def test_explicit_board_cli_route_beats_inherited_worker_db_pin(kanban_home, monkeypatch, capsys):
+    """All CLI operations stay on explicit B despite an A worker's env pins."""
+    kb.create_board("a")
+    kb.create_board("b")
+    a_db = kb.kanban_db_path(board="a")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(a_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "a")
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    def invoke(*parts: str) -> tuple[int, str]:
+        args = parser.parse_args(["kanban", "--board", "b", *parts])
+        rc = kc.kanban_command(args)
+        return rc, capsys.readouterr().out
+
+    rc, output = invoke(
+        "create", "parent", "--idempotency-key", "parent-on-b", "--json",
+    )
+    assert rc == 0
+    parent_id = json.loads(output)["id"]
+
+    rc, output = invoke(
+        "create", "child", "--idempotency-key", "child-on-b", "--json",
+    )
+    assert rc == 0
+    child_id = json.loads(output)["id"]
+
+    # The repeat must resolve the original B task, not create one on A.
+    rc, output = invoke(
+        "create", "child", "--idempotency-key", "child-on-b", "--json",
+    )
+    assert rc == 0
+    assert json.loads(output)["id"] == child_id
+
+    rc, output = invoke("show", child_id)
+    assert rc == 0
+    assert f"Task {child_id}: child" in output
+
+    rc, _ = invoke("link", parent_id, child_id)
+    assert rc == 0
+    rc, _ = invoke("complete", parent_id, "--summary", "parent done on b")
+    assert rc == 0
+    rc, _ = invoke("complete", child_id, "--summary", "done on b")
+    assert rc == 0
+
+    with kb.connect_closing(board="b") as conn:
+        assert [task.title for task in kb.list_tasks(conn, limit=100)] == ["parent", "child"]
+        assert kb.get_task(conn, child_id).status == "done"
+        assert kb.parent_ids(conn, child_id) == [parent_id]
+    with kb.connect_closing(board="a") as conn:
+        assert kb.list_tasks(conn, limit=100) == []
+
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
@@ -177,5 +232,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
-

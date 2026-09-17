@@ -330,6 +330,42 @@ def test_cross_board_refusal_is_not_reported_as_terminal(monkeypatch, live_worke
     assert "worker run is over" not in payload.get("error", "")
 
 
+def test_source_run_on_a_cannot_mutate_explicitly_scoped_b(monkeypatch, live_worker):
+    """Routing to B must still fence a worker whose source run only exists on A."""
+    from hermes_cli import kanban_db as kb
+
+    with operator_env(monkeypatch):
+        kb.create_board("a")
+        kb.create_board("b")
+        with kb.connect_closing(board="a") as conn:
+            source = kb.create_task(conn, title="source on a", assignee="peer")
+            claimed = kb.claim_task(conn, source, claimer="stable-lock")
+            assert claimed is not None
+            run_id = int(claimed.current_run_id)
+
+    a_db = kb.kanban_db_path(board="a")
+    b_db = kb.kanban_db_path(board="b")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(a_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "a")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", source)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    # The scoped route now reaches B rather than silently following A's legacy
+    # DB pin. SourceRunFence is the first write guard and rejects before B can
+    # receive the attempted target mutation.
+    with kb.scoped_current_board("b"):
+        assert kb.kanban_db_path() == b_db
+        with kb.connect_closing() as conn:
+            with pytest.raises(kb.SourceRunFenceError, match="absent from the selected board"):
+                kb.create_task(conn, title="must-not-land-on-b", assignee="peer")
+
+    with operator_env(monkeypatch):
+        with kb.connect_closing(board="b") as conn:
+            assert kb.list_tasks(conn) == []
+        with kb.connect_closing(board="a") as conn:
+            assert kb.get_task(conn, source).current_run_id == run_id
+
+
 def test_replaced_run_cannot_start_dispatch_tick(monkeypatch, live_worker):
     from hermes_cli import kanban_db as kb
 

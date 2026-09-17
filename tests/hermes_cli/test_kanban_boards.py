@@ -98,12 +98,23 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_explicit_board_wins_over_legacy_db_override(self, fresh_home, tmp_path, monkeypatch):
+        """An explicit board is a deliberate route, not an inherited DB pin."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        assert kb.kanban_db_path(board="ignored") == (
+            fresh_home / "kanban" / "boards" / "ignored" / "kanban.db"
+        )
+
+    def test_scoped_board_wins_over_legacy_db_override(self, fresh_home, tmp_path, monkeypatch):
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+
+        with kb.scoped_current_board("ignored"):
+            assert kb.kanban_db_path() == (
+                fresh_home / "kanban" / "boards" / "ignored" / "kanban.db"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +352,4 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
-
 
