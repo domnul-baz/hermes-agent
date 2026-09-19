@@ -74,6 +74,8 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import datetime
+import math
 import os
 import re
 import random
@@ -609,6 +611,227 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def _resolve_rate_limit_provider_identity(
+    *, assignee: Optional[str], provider_override: Optional[str],
+) -> Optional[tuple[str, str, str, str]]:
+    """Resolve canonical provider, pool key, safe identity, and home for a profile.
+
+    This intentionally reads profile configuration only.  In particular, it
+    never opens auth or a credential pool, so the dispatcher may safely call
+    it while checking a persisted reset on every tick.
+    """
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+        from hermes_cli.providers import resolve_provider_full
+        from agent.credential_pool import resolve_runtime_pool_key
+
+        profile = normalize_profile_name(assignee or "")
+        # resolve_profile_env validates a non-default profile and, unlike
+        # get_profile_dir(), preserves the launch root's lexical spelling.
+        assignee_home = resolve_profile_env(profile)
+        token = set_hermes_home_override(assignee_home)
+        try:
+            cfg = load_config()
+            model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+            if not isinstance(model_cfg, dict):
+                return None
+            configured_provider = str(model_cfg.get("provider") or "").strip()
+            requested_provider = str(provider_override or configured_provider).strip()
+            if not requested_provider:
+                return None
+            provider_def = resolve_provider_full(
+                requested_provider,
+                user_providers=cfg.get("providers"),
+                # Match the CLI's v12+/legacy compatibility view.  Passing
+                # raw custom_providers here loses keyed-provider identities.
+                custom_providers=get_compatible_custom_providers(cfg),
+            )
+            if provider_def is None:
+                return None
+            provider = str(getattr(provider_def, "id", "") or "").strip().lower()
+            if not provider:
+                return None
+            resolved_base_url = str(
+                getattr(provider_def, "base_url", "") or ""
+            ).strip().rstrip("/")
+            # A task override changes the runtime provider, so never borrow
+            # the profile model's endpoint for it.  Without an override the
+            # profile's explicit model endpoint is the runtime endpoint.
+            base_url = (
+                resolved_base_url if provider_override
+                else str(model_cfg.get("base_url") or resolved_base_url).strip().rstrip("/")
+            )
+            pool_key = resolve_runtime_pool_key(provider, base_url)
+            if not pool_key:
+                return None
+            # Common provider pool keys are just their provider id, so include
+            # a safe endpoint digest to invalidate a stale reset when an
+            # endpoint changes without persisting URL userinfo or query data.
+            normalized_pool_key = str(pool_key).strip().lower()
+            identity = json.dumps(
+                [
+                    provider,
+                    normalized_pool_key,
+                    hashlib.sha256(base_url.encode("utf-8")).hexdigest(),
+                ],
+                separators=(",", ":"),
+            )
+            return provider, pool_key, identity, assignee_home
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return None
+
+
+_RATE_LIMIT_REASON_RE = re.compile(r"(?:rate[_ -]?limit|usage[_ -]?limit|quota|\b429\b)", re.I)
+
+
+def _parse_rate_limit_reset_at(value: Any) -> Optional[int]:
+    """Parse a persisted absolute reset timestamp without touching auth state."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                numeric = float(value)
+            except ValueError:
+                iso = value.replace("Z", "+00:00")
+                parsed = datetime.datetime.fromisoformat(iso)
+                if parsed.tzinfo is None:
+                    return None
+                numeric = parsed.timestamp()
+            value = numeric
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+        # Unix millisecond timestamps are unambiguous at current epoch.
+        if value >= 100_000_000_000:
+            value /= 1000
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _rate_limit_reset_from_entries(entries: Any, *, detected_at: int) -> Optional[int]:
+    """Return earliest trustworthy future reset when every live entry is quota-exhausted.
+
+    This is deliberately pure: callers hand it raw ``auth.json`` dictionaries,
+    and it neither normalizes nor persists credentials.
+    """
+    if not isinstance(entries, list):
+        return None
+    if any(not isinstance(entry, dict) for entry in entries):
+        return None
+    live_entries = [entry for entry in entries
+                    if str(entry.get("last_status") or "").lower() != "dead"]
+    if not live_entries:
+        return None
+    resets: list[int] = []
+    for entry in live_entries:
+        if str(entry.get("last_status") or "").lower() != "exhausted":
+            return None
+        marker = " ".join(str(entry.get(key) or "") for key in (
+            "last_error_code", "last_error_reason",
+        ))
+        if not _RATE_LIMIT_REASON_RE.search(marker):
+            return None
+        reset_at = _parse_rate_limit_reset_at(entry.get("last_error_reset_at"))
+        if reset_at is None or reset_at <= detected_at:
+            return None
+        resets.append(reset_at)
+    return min(resets) if resets else None
+
+
+def _rate_limit_pool_metadata(
+    *, assignee: Optional[str], provider_override: Optional[str], detected_at: int,
+) -> dict:
+    """Best-effort, non-secret pool reset metadata for one rc75 reaping.
+
+    This deliberately runs only on the worker-exit path.  The dispatcher hot
+    path must not open auth stores or credential pools per tick; it consumes
+    the resulting SQLite metadata instead.  Any resolution failure retains the
+    historical fixed-cooldown behaviour by returning no metadata.
+    """
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.auth import read_credential_pool
+        from hermes_cli.profiles import normalize_profile_name
+
+        resolved = _resolve_rate_limit_provider_identity(
+            assignee=assignee, provider_override=provider_override,
+        )
+        if resolved is None:
+            return {}
+        provider, pool_key, identity, assignee_home = resolved
+        token = set_hermes_home_override(assignee_home)
+        try:
+            reset_at = _rate_limit_reset_from_entries(
+                read_credential_pool(pool_key), detected_at=detected_at,
+            )
+            if reset_at is None:
+                return {}
+            return {
+                "rate_limit_provider": provider,
+                "rate_limit_identity": identity,
+                "rate_limit_profile": normalize_profile_name(assignee or ""),
+                "rate_limit_reset_at": min(
+                    int(reset_at), detected_at + RATE_LIMIT_RESET_MAX_SECONDS,
+                ),
+                "rate_limit_reset_source": "pool",
+            }
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        # Pool/config errors are intentionally indistinguishable from legacy
+        # boards: fall open to the fixed cooldown without exposing auth data.
+        return {}
+
+
+def _merge_rate_limit_metadata(
+    conn: sqlite3.Connection, *, task_id: str, run_id: int, metadata: dict,
+) -> None:
+    """Best-effort post-commit merge for the exact rc75 run and event."""
+    if not metadata:
+        return
+    try:
+        with write_txn(conn):
+            run = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? "
+                "AND outcome = 'rate_limited' AND status = 'rate_limited'",
+                (run_id, task_id),
+            ).fetchone()
+            event = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
+                "AND kind = 'rate_limited' ORDER BY id DESC LIMIT 1",
+                (task_id, run_id),
+            ).fetchone()
+            if run is None or event is None:
+                return
+            try:
+                run_metadata = json.loads(run["metadata"] or "{}")
+                event_payload = json.loads(event["payload"] or "{}")
+            except (TypeError, ValueError):
+                return
+            if not isinstance(run_metadata, dict) or not isinstance(event_payload, dict):
+                return
+            run_metadata.update(metadata)
+            event_payload.update(metadata)
+            conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ? "
+                         "AND outcome = 'rate_limited' AND status = 'rate_limited'",
+                         (json.dumps(run_metadata, ensure_ascii=False), run_id, task_id))
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ? AND task_id = ? "
+                         "AND run_id = ? AND kind = 'rate_limited'",
+                         (json.dumps(event_payload, ensure_ascii=False), event["id"], task_id, run_id))
+    except Exception:
+        # The task may have transitioned between transactions.  Metadata is
+        # advisory, so never disturb the completed reclaim.
+        return
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -8236,6 +8459,9 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # without thrashing. Overridable via ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+# Pool reset timestamps are advisory; never let one park a task for longer
+# than a day, even if auth metadata was corrupted or manually edited.
+RATE_LIMIT_RESET_MAX_SECONDS = 24 * 60 * 60
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -9298,10 +9524,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    # Metadata reads config/auth and therefore must happen after the reclaim
+    # transaction commits.  Entries are appended only by the winning CAS.
+    rate_limit_metadata_requests: list[dict] = []
     board_db_path = _connection_main_db_path(conn)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT t.id, t.current_run_id, t.worker_pid, t.claim_lock, t.assignee, "
+            "       t.provider_override, "
             "       COALESCE(r.started_at, t.started_at) AS run_started_at "
             "FROM tasks t "
             "LEFT JOIN task_runs r ON r.id = t.current_run_id AND r.task_id = t.id "
@@ -9460,6 +9690,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                    if run_id is not None:
+                        rate_limit_metadata_requests.append({
+                            "task_id": row["id"], "run_id": int(run_id),
+                            "profile": row["assignee"],
+                            "provider": row["provider_override"],
+                            "detected_at": int(detected_at),
+                        })
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9478,6 +9715,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+    # The 300-second fixed cooldown already committed above gives this
+    # best-effort enrichment ample time before a normal retry.  Crucially it
+    # is not computed for CAS losers and no profile/config/auth I/O occurred
+    # while the main BEGIN IMMEDIATE transaction was open.
+    for request in rate_limit_metadata_requests:
+        metadata = _rate_limit_pool_metadata(
+            assignee=request["profile"],
+            provider_override=request["provider"],
+            detected_at=request["detected_at"],
+        )
+        _merge_rate_limit_metadata(
+            conn, task_id=request["task_id"], run_id=request["run_id"], metadata=metadata,
+        )
+
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
@@ -9930,7 +10181,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee, provider_override FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9950,7 +10201,7 @@ def check_respawn_guard(
     #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
@@ -9965,7 +10216,41 @@ def check_respawn_guard(
             # re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        wait_until = int(ended_at or 0) + rl_cooldown
+        # Persisted pool data is advisory and must remain safely bounded.  A
+        # reassigned task must not inherit an old profile's exhausted pool;
+        # likewise changing either the current override or the assignee
+        # profile's provider/endpoint invalidates old metadata.  Resolving the
+        # identity reads config only, never auth or a credential pool.
+        try:
+            metadata = json.loads(latest_run["metadata"] or "{}")
+            reset_at = metadata.get("rate_limit_reset_at")
+            saved_profile = metadata.get("rate_limit_profile")
+            saved_provider = metadata.get("rate_limit_provider")
+            saved_identity = metadata.get("rate_limit_identity")
+            valid_reset = (
+                isinstance(reset_at, int) and not isinstance(reset_at, bool)
+                and isinstance(saved_profile, str) and isinstance(saved_provider, str)
+                and isinstance(saved_identity, str)
+                and saved_profile == _canonical_assignee(row["assignee"])
+                and reset_at > now
+                and reset_at <= int(ended_at or 0) + RATE_LIMIT_RESET_MAX_SECONDS
+            )
+            if valid_reset:
+                # Do not read profile config for malformed, legacy, expired,
+                # or reassigned metadata.  This is the hot dispatcher path.
+                current_identity = _resolve_rate_limit_provider_identity(
+                    assignee=row["assignee"], provider_override=row["provider_override"],
+                )
+                if (current_identity is not None
+                        and current_identity[0] == saved_provider
+                        and current_identity[2] == saved_identity):
+                    wait_until = max(wait_until, reset_at)
+        except Exception:
+            # Missing/malformed legacy metadata is exactly the old fixed
+            # cooldown path.
+            pass
+        if now < wait_until:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we

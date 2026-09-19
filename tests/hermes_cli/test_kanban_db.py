@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -365,6 +367,365 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         # though last_failure_error contains "rate-limited".
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
         assert kb.check_respawn_guard(conn, tid) is None
+
+
+def _seed_rate_limited_run(conn, task_id, *, ended_at, metadata=None):
+    """Create a closed rc75 run directly, without invoking auth/pool code."""
+    kb.claim_task(conn, task_id)
+    run_id = kb.get_task(conn, task_id).current_run_id
+    conn.execute(
+        "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+        "ended_at=?, metadata=? WHERE id=?",
+        (ended_at, json.dumps(metadata) if metadata is not None else None, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+        ("pid exited rate-limited (quota wall) — requeued", task_id),
+    )
+    conn.commit()
+
+
+def _safe_rate_limit_identity(provider, pool_key, base_url):
+    return json.dumps(
+        [provider, pool_key, hashlib.sha256(base_url.encode("utf-8")).hexdigest()],
+        separators=(",", ":"),
+    )
+
+
+def test_respawn_guard_uses_bounded_pool_reset_without_pool_reads(kanban_home, monkeypatch):
+    """A known long reset wins over the 300-second probe cadence in SQLite."""
+    import agent.credential_pool as credential_pool
+    now = 9_000_000
+    identity = _safe_rate_limit_identity(
+        "openai-codex", "openai-codex", "https://api.openai.com",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(credential_pool, "load_pool", lambda _key: pytest.fail("guard read pool"))
+    monkeypatch.setattr(
+        kb, "_resolve_rate_limit_provider_identity",
+        lambda **_kw: ("openai-codex", "openai-codex", identity, "/assignee-home"),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="long reset", assignee="default")
+        _seed_rate_limited_run(conn, tid, ended_at=now, metadata={
+            "rate_limit_provider": "openai-codex",
+            "rate_limit_identity": identity,
+            "rate_limit_profile": "default",
+            "rate_limit_reset_at": now + 14 * 3600,
+            "rate_limit_reset_source": "pool",
+        })
+        # Six-minute dispatcher ticks across the whole wall remain SQLite-only
+        # and cannot probe before the persisted reset.
+        for tick in range(now + 360, now + 14 * 3600, 360):
+            monkeypatch.setattr(kb.time, "time", lambda tick=tick: tick)
+            assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb.time, "time", lambda: now + 14 * 3600)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_ignores_reset_beyond_24_hour_horizon(kanban_home, monkeypatch):
+    """Corrupt metadata cannot park a rate-limited task past the 24-hour cap."""
+    now = 9_000_000
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(
+        kb, "_resolve_rate_limit_provider_identity",
+        lambda **_kw: pytest.fail("far-future metadata must be rejected before config reads"),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="corrupt reset", assignee="default")
+        _seed_rate_limited_run(conn, tid, ended_at=now, metadata={
+            "rate_limit_provider": "p",
+            "rate_limit_identity": "identity",
+            "rate_limit_profile": "default",
+            "rate_limit_reset_at": now + 99 * 3600,
+            "rate_limit_reset_source": "pool",
+        })
+        monkeypatch.setattr(kb.time, "time", lambda: now + kb.RATE_LIMIT_RESET_MAX_SECONDS)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+@pytest.mark.parametrize("metadata", [
+    {"rate_limit_reset_at": 5_000_100},
+    {"rate_limit_provider": "p", "rate_limit_profile": "default", "rate_limit_reset_at": "bad"},
+    {"rate_limit_provider": "p", "rate_limit_profile": "default", "rate_limit_reset_at": 5_000_100},
+])
+def test_respawn_guard_bad_or_short_pool_reset_keeps_fixed_cooldown(kanban_home, monkeypatch, metadata):
+    now = 5_000_000
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(
+        kb, "_resolve_rate_limit_provider_identity",
+        lambda **_kw: pytest.fail("legacy/malformed metadata must not read profile config"),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="fallback", assignee="default")
+        _seed_rate_limited_run(conn, tid, ended_at=now, metadata=metadata)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        monkeypatch.setattr(kb.time, "time", lambda: now + 301)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+@pytest.mark.parametrize(("metadata", "expected_resolver_calls"), [
+    (
+        {
+            "rate_limit_provider": "new",
+            "rate_limit_identity": "new-identity",
+            "rate_limit_profile": "former",
+        },
+        [],
+    ),
+    (
+        {
+            "rate_limit_provider": "old",
+            "rate_limit_identity": "old-identity",
+            "rate_limit_profile": "default",
+        },
+        [("default", "new")],
+    ),
+])
+def test_respawn_guard_ignores_stale_profile_or_provider_reset(
+    kanban_home, monkeypatch, metadata, expected_resolver_calls,
+):
+    now = 7_000_000
+    resolver_calls = []
+
+    def resolve_identity(*, assignee, provider_override):
+        resolver_calls.append((assignee, provider_override))
+        return "new", "new-pool", "new-identity", "/assignee-home"
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(kb.time, "time", lambda: now + 301)
+    monkeypatch.setattr(kb, "_resolve_rate_limit_provider_identity", resolve_identity)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="reassigned", assignee="default",
+            model_override="model", provider_override="new",
+        )
+        _seed_rate_limited_run(conn, tid, ended_at=now, metadata={
+            **metadata, "rate_limit_reset_at": now + 14 * 3600,
+            "rate_limit_reset_source": "pool",
+        })
+        assert kb.check_respawn_guard(conn, tid) is None
+    assert resolver_calls == expected_resolver_calls
+
+
+def test_respawn_guard_zero_cooldown_bypasses_pool_reset(kanban_home, monkeypatch):
+    now = 8_000_000
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bypass", assignee="default")
+        _seed_rate_limited_run(conn, tid, ended_at=now, metadata={
+            "rate_limit_provider": "p", "rate_limit_profile": "default",
+            "rate_limit_reset_at": now + 14 * 3600, "rate_limit_reset_source": "pool",
+        })
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_rate_limit_pool_metadata_uses_raw_auth_read_and_never_persists_secrets(kanban_home, monkeypatch):
+    """The reaper stores only the allowlisted reset, and only when all fail."""
+    import agent.credential_pool as credential_pool
+    import hermes_cli.auth as auth
+    import hermes_cli.config as config
+    import hermes_cli.providers as providers
+    now = 6_000_000
+    secret_endpoint = "https://user:supersecret@p.example/v1?api_key=also-secret"
+
+    monkeypatch.setattr(config, "load_config", lambda: {"model": {"provider": "p"}})
+    monkeypatch.setattr(providers, "resolve_provider_full", lambda *_a, **_k: types.SimpleNamespace(id="p", base_url=secret_endpoint))
+    monkeypatch.setattr(credential_pool, "resolve_runtime_pool_key", lambda *_a: "p")
+    monkeypatch.setattr(credential_pool, "load_pool", lambda _key: pytest.fail("must not load pool"))
+    monkeypatch.setattr(auth, "write_credential_pool", lambda *_a, **_k: pytest.fail("must not write auth"))
+    monkeypatch.setattr(auth, "read_credential_pool", lambda key: [{
+        "last_status": "exhausted", "last_error_code": 429,
+        "last_error_reset_at": now + 99 * 3600, "token": "never-persist",
+    }] if key == "p" else pytest.fail("wrong pool key"))
+    metadata = kb._rate_limit_pool_metadata(assignee="default", provider_override=None, detected_at=now)
+    assert metadata == {
+        "rate_limit_provider": "p",
+        "rate_limit_identity": _safe_rate_limit_identity("p", "p", secret_endpoint), "rate_limit_profile": "default",
+        "rate_limit_reset_at": now + kb.RATE_LIMIT_RESET_MAX_SECONDS,
+        "rate_limit_reset_source": "pool",
+    }
+    serialized_metadata = json.dumps(metadata)
+    assert secret_endpoint not in serialized_metadata
+    assert "supersecret" not in serialized_metadata
+    monkeypatch.setattr(auth, "read_credential_pool", lambda _key: [{"last_status": "available"}])
+    assert kb._rate_limit_pool_metadata(assignee="default", provider_override=None, detected_at=now) == {}
+
+
+@pytest.mark.parametrize(("entries", "expected"), [
+    ([
+        {"last_status": "exhausted", "last_error_code": 429, "last_error_reset_at": "6000100"},
+        {"last_status": "exhausted", "last_error_reason": "quota", "last_error_reset_at": 6000200000},
+    ], 6000100),
+    ([{"last_status": "exhausted", "last_error_reason": "usage_limit", "last_error_reset_at": "1970-03-11T10:41:41+00:00"}], 6000101),
+    ([{"last_status": "available"}], None),
+    ([{"last_status": "dead"}], None),
+    ([{"last_status": "exhausted", "last_error_reason": "network", "last_error_reset_at": 6000100}], None),
+    ([{"last_status": "exhausted", "last_error_reason": "quota", "last_error_reset_at": "bad"}], None),
+    ([{"last_status": "exhausted", "last_error_reason": "quota", "last_error_reset_at": 5999999}], None),
+    (["malformed"], None),
+])
+def test_rate_limit_raw_entry_evaluator_is_strict_and_parses_resets(entries, expected):
+    assert kb._rate_limit_reset_from_entries(entries, detected_at=6_000_000) == expected
+
+
+@pytest.mark.parametrize("load_raises", [False, True])
+def test_rate_limit_pool_metadata_uses_assignee_home_and_restores_dispatcher_home(
+    kanban_home, monkeypatch, load_raises,
+):
+    """The one-time pool read is profile-scoped and always restores the dispatcher."""
+    import agent.credential_pool as credential_pool
+    import hermes_cli.auth as auth
+    from hermes_constants import (
+        get_hermes_home_override,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    dispatcher_home = "/dispatcher-home"
+    assignee_home = "/assignee-home"
+    observed_homes = []
+
+    def read_pool(_key):
+        observed_homes.append(get_hermes_home_override())
+        if load_raises:
+            raise RuntimeError("pool unavailable")
+        return [{"last_status": "exhausted", "last_error_reason": "quota",
+                 "last_error_reset_at": 6_000_100}]
+
+    monkeypatch.setattr(
+        kb, "_resolve_rate_limit_provider_identity",
+        lambda **_kw: ("safe-provider", "pool-key", "safe-identity", assignee_home),
+    )
+    monkeypatch.setattr(credential_pool, "load_pool", lambda _key: pytest.fail("must not load pool"))
+    monkeypatch.setattr(auth, "read_credential_pool", read_pool)
+    dispatcher_token = set_hermes_home_override(dispatcher_home)
+    try:
+        metadata = kb._rate_limit_pool_metadata(
+            assignee="worker", provider_override=None, detected_at=6_000_000,
+        )
+        assert get_hermes_home_override() == dispatcher_home
+    finally:
+        reset_hermes_home_override(dispatcher_token)
+
+    assert observed_homes == [assignee_home]
+    assert metadata == ({} if load_raises else {
+        "rate_limit_provider": "safe-provider", "rate_limit_identity": "safe-identity", "rate_limit_profile": "worker",
+        "rate_limit_reset_at": 6_000_100, "rate_limit_reset_source": "pool",
+    })
+
+
+@pytest.mark.parametrize("config_value, resolver, pool", [
+    ({}, None, None),
+    ({"model": {"provider": "p"}}, RuntimeError("unresolvable"), None),
+    ({"model": {"provider": "p"}}, None, RuntimeError("pool unavailable")),
+])
+def test_rate_limit_pool_metadata_fail_open(kanban_home, monkeypatch, config_value, resolver, pool):
+    import agent.credential_pool as credential_pool
+    import hermes_cli.config as config
+    import hermes_cli.providers as providers
+    monkeypatch.setattr(config, "load_config", lambda: config_value)
+    if resolver:
+        monkeypatch.setattr(providers, "resolve_provider_full", lambda *_a, **_k: (_ for _ in ()).throw(resolver))
+    if pool:
+        monkeypatch.setattr(credential_pool, "load_pool", lambda _key: (_ for _ in ()).throw(pool))
+    assert kb._rate_limit_pool_metadata(
+        assignee="missing-profile" if not resolver and not pool else "default",
+        provider_override=None, detected_at=6_000_000,
+    ) == {}
+
+
+def test_rate_limit_pool_metadata_missing_assignee_profile_never_reads_pool(
+    kanban_home, monkeypatch,
+):
+    """A missing profile must not borrow dispatcher/global credentials."""
+    import agent.credential_pool as credential_pool
+    import hermes_cli.config as config
+
+    monkeypatch.setattr(config, "load_config", lambda: pytest.fail("read missing profile config"))
+    monkeypatch.setattr(credential_pool, "load_pool", lambda _key: pytest.fail("read pool"))
+    assert kb._rate_limit_pool_metadata(
+        assignee="missing-profile", provider_override="openai-codex", detected_at=6_000_000,
+    ) == {}
+
+
+@pytest.mark.parametrize(("new_provider", "new_base_url"), [
+    ("q", "https://old"),
+    ("p", "https://new"),
+])
+def test_respawn_guard_ignores_reset_after_profile_provider_config_changes(
+    kanban_home, monkeypatch, new_provider, new_base_url,
+):
+    """A profile provider or endpoint change invalidates a saved reset."""
+    import agent.credential_pool as credential_pool
+    import hermes_cli.config as config
+    import hermes_cli.providers as providers
+
+    now = 6_500_000
+    current_config = {"model": {"provider": "p", "base_url": "https://old"}}
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(config, "load_config", lambda: current_config)
+    resolved_providers = []
+
+    def resolve_provider(name, **_kwargs):
+        resolved_providers.append(name)
+        return types.SimpleNamespace(id=name, base_url="https://resolved")
+
+    monkeypatch.setattr(providers, "resolve_provider_full", resolve_provider)
+    resolved_pool_keys = []
+
+    def resolve_pool_key(provider, base_url):
+        resolved_pool_keys.append((provider, base_url))
+        return "p"
+
+    monkeypatch.setattr(credential_pool, "resolve_runtime_pool_key", resolve_pool_key)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="profile provider changed", assignee="default")
+        _seed_rate_limited_run(conn, tid, ended_at=now, metadata={
+            "rate_limit_provider": "p",
+            "rate_limit_identity": _safe_rate_limit_identity("p", "p", "https://old"),
+            "rate_limit_profile": "default",
+            "rate_limit_reset_at": now + 14 * 3600,
+            "rate_limit_reset_source": "pool",
+        })
+        current_config["model"].update(provider=new_provider, base_url=new_base_url)
+        monkeypatch.setattr(kb.time, "time", lambda: now + 301)
+        assert kb.check_respawn_guard(conn, tid) is None
+    assert resolved_providers == [new_provider]
+    assert resolved_pool_keys == [(new_provider, new_base_url)]
+
+
+def test_rc75_reap_persists_only_sanitized_pool_metadata_and_stays_neutral(kanban_home, monkeypatch):
+    """Reaping copies the allowlist to both event and run, never a pool secret."""
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    def metadata_after_commit(**_kw):
+        assert not conn.in_transaction
+        return {
+        "rate_limit_provider": "p", "rate_limit_profile": "default",
+        "rate_limit_identity": "opaque-identity",
+        "rate_limit_reset_at": 6_100_000, "rate_limit_reset_source": "pool",
+        }
+    with kb.connect() as conn:
+        monkeypatch.setattr(kb, "_rate_limit_pool_metadata", metadata_after_commit)
+        tid = kb.create_task(conn, title="sanitized", assignee="default")
+        kb.claim_task(conn, tid)
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (70001, tid))
+        conn.commit()
+        kb._record_worker_exit(70001, _exited_status(kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+        kb.detect_crashed_workers(conn)
+        run = kb.latest_run(conn, tid)
+        event = next(e for e in kb.list_events(conn, tid) if e.kind == "rate_limited")
+        allowlisted = {
+            "rate_limit_provider", "rate_limit_profile", "rate_limit_reset_at",
+            "rate_limit_reset_source", "rate_limit_identity",
+        }
+        assert {k: run.metadata[k] for k in allowlisted} == {k: event.payload[k] for k in allowlisted}
+        assert not ({"token", "label", "entry_id", "reason", "message"} & set(run.metadata))
+        assert kb.get_task(conn, tid).consecutive_failures == 0
 
 
 def test_workspace_failure_force_trips_breaker_without_second_resolution(
