@@ -256,6 +256,9 @@ class TestWorkerSpawnEnv:
 
     def test_default_spawn_sets_env_vars(self, fresh_home, monkeypatch):
         captured = {}
+        custom_kanban_home = fresh_home / "custom-kanban-home"
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(custom_kanban_home))
+        inherited_root = fresh_home / "inherited-live-kanban"
 
         class FakeProc:
             pid = 12345
@@ -267,6 +270,12 @@ class TestWorkerSpawnEnv:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
+        monkeypatch.setenv(
+            kb._KANBAN_DB_GUARD_DENY_ROOTS_ENV,
+            os.pathsep.join(
+                (str(inherited_root), str(custom_kanban_home), str(inherited_root))
+            ),
+        )
 
         task = kb.Task(
             id="t_abc",
@@ -292,9 +301,19 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
         assert env["HERMES_KANBAN_TASK"] == "t_abc"
         # DB path should match the per-board DB, not the legacy default.
-        expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
+        expected_db = (
+            custom_kanban_home / "kanban" / "boards" / "spawntest" / "kanban.db"
+        )
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
-        expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
+        guard_roots = env[kb._KANBAN_DB_GUARD_DENY_ROOTS_ENV].split(os.pathsep)
+        assert guard_roots == [
+            str(custom_kanban_home.resolve()),
+            str(expected_db.parent.resolve()),
+            str(inherited_root.resolve()),
+        ]
+        expected_ws = (
+            custom_kanban_home / "kanban" / "boards" / "spawntest" / "workspaces"
+        )
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
 
@@ -352,4 +371,3 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-

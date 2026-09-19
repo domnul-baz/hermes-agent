@@ -48,10 +48,10 @@ overrides still work:
   paths. Useful for tests and unusual deployments.
 
 The dispatcher injects ``HERMES_KANBAN_DB``,
-``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
+``HERMES_KANBAN_WORKSPACES_ROOT``, ``HERMES_KANBAN_BOARD``, and the
+Kanban test-guard deny root into worker subprocess env so workers converge
+on the exact DB the dispatcher used to claim their task — even under unusual
+symlink or Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
 task_events.  The ``workspace_kind`` field decouples coordination from git
@@ -1912,6 +1912,84 @@ _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
+# A pytest subprocess can inherit a live dispatcher's DB/board pins after its
+# own HERMES_HOME sandbox has been rebuilt or discarded. Keep refusal at the
+# writable-open choke point, before SQLite creates a DB or WAL sidecars. The
+# state DB owns pytest-context detection, so reuse it lazily here. Intentional
+# read-only probes such as ``count_notify_subs`` are out of scope.
+_KANBAN_DB_GUARD_BYPASS = False
+_KANBAN_DB_GUARD_BYPASS_ENV = "HERMES_KANBAN_DB_GUARD_BYPASS"
+_KANBAN_DB_GUARD_DENY_ROOTS_ENV = "HERMES_KANBAN_DB_GUARD_DENY_ROOTS"
+_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS: tuple[Path, ...] = ()
+
+
+def _kanban_guard_roots() -> list[Path]:
+    """Return canonical Kanban roots that a pytest context must not open."""
+    roots: list[Path] = []
+    try:
+        # This import is intentionally lazy: ordinary Kanban use need not
+        # load state DB machinery just to decide whether pytest is active.
+        from hermes_state import _real_platform_state_root
+
+        root = _real_platform_state_root()
+        if root is not None:
+            roots.append(root)
+    except Exception:
+        pass
+    env_roots = os.environ.get(_KANBAN_DB_GUARD_DENY_ROOTS_ENV, "")
+    candidates: Iterable[Path | str] = (
+        *_KANBAN_DB_GUARD_EXTRA_DENY_ROOTS,
+        *(root for root in env_roots.split(os.pathsep) if root),
+    )
+    for candidate in candidates:
+        try:
+            roots.append(Path(candidate).expanduser().resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _is_production_kanban_db(resolved: Path, root: Path) -> bool:
+    """Whether *resolved* has one of Kanban's canonical production shapes."""
+    if resolved.name != "kanban.db":
+        return False
+    if resolved.parent == root:
+        return True
+    try:
+        parts = resolved.relative_to(root).parts
+    except ValueError:
+        return False
+    return len(parts) == 4 and parts[:2] == ("kanban", "boards")
+
+
+def _ensure_test_kanban_isolation(db_path: Path) -> None:
+    """Refuse pytest-context writable opens of canonical live Kanban DBs."""
+    if _KANBAN_DB_GUARD_BYPASS or os.environ.get(_KANBAN_DB_GUARD_BYPASS_ENV):
+        return
+    try:
+        from hermes_state import _in_test_context
+
+        if not _in_test_context():
+            return
+    except Exception:
+        return
+    try:
+        resolved = Path(db_path).expanduser().resolve()
+    except Exception:
+        return
+    for root in _kanban_guard_roots():
+        if _is_production_kanban_db(resolved, root):
+            raise RuntimeError(
+                "live-system guard: test attempted to open production "
+                f"kanban.db at {resolved} (under Kanban root {root}). "
+                "Tests must run against a temporary HERMES_HOME or an "
+                "explicit scratch db_path. If this test genuinely needs "
+                "the live database, set "
+                "hermes_cli.kanban_db._KANBAN_DB_GUARD_BYPASS = True "
+                "in-process — or, for a spawned child process, export "
+                f"{_KANBAN_DB_GUARD_BYPASS_ENV}=1."
+            )
+
 # Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per
 # board DB. Content-addressing already dedupes identical corrupt bytes, but
 # repeatedly-mutating corruption (partial repairs, further damage between
@@ -1956,6 +2034,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     advisory locks on the database (see ``hermes_cli.sqlite_safe_read``).
     The registration is released automatically when the connection closes.
     """
+    _ensure_test_kanban_isolation(path)
     from hermes_cli.sqlite_safe_read import connect_tracked
 
     busy_timeout_ms = _resolve_busy_timeout_ms()
@@ -1996,6 +2075,7 @@ def _cross_process_init_lock(path: Path):
     is redundant work, not corruption. A bounded "proceed anyway" beats an
     unbounded hang that silently stops the board.
     """
+    _ensure_test_kanban_isolation(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".init.lock")
     handle = lock_path.open("a+b")
@@ -2622,6 +2702,7 @@ def repair_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _ensure_test_kanban_isolation(path)
     try:
         resolved = path.resolve()
     except OSError:
@@ -2727,6 +2808,7 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _ensure_test_kanban_isolation(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2893,6 +2975,7 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    _ensure_test_kanban_isolation(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
@@ -11656,8 +11739,34 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    board_db_path = str(kanban_db_path(board=board).resolve())
+    board_db = kanban_db_path(board=board).resolve()
+    board_db_path = str(board_db)
     env["HERMES_KANBAN_DB"] = board_db_path
+    # Intentionally inherit deny roots into delegated descendants: this is
+    # test-safety metadata, not a board-routing pin.
+    guard_roots: list[Path] = [
+        kanban_home().resolve(),
+        board_db.parent.resolve(),
+    ]
+    inherited_roots = env.get(_KANBAN_DB_GUARD_DENY_ROOTS_ENV, "").split(
+        os.pathsep
+    )
+    for inherited_root in inherited_roots:
+        if not inherited_root:
+            continue
+        try:
+            guard_roots.append(Path(inherited_root).expanduser().resolve())
+        except (OSError, RuntimeError):
+            continue
+    deduped_guard_roots: list[Path] = []
+    seen_guard_roots: set[Path] = set()
+    for root in guard_roots:
+        if root not in seen_guard_roots:
+            seen_guard_roots.add(root)
+            deduped_guard_roots.append(root)
+    env[_KANBAN_DB_GUARD_DENY_ROOTS_ENV] = os.pathsep.join(
+        str(root) for root in deduped_guard_roots
+    )
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
