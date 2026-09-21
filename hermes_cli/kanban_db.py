@@ -90,7 +90,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Literal, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -486,6 +486,10 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.capacity_capped,
+            result.capacity_deferred,
+            result.claim_contended,
+            result.spawn_failure_count,
         )):
             outcome = "idle"
         invoke_hook(
@@ -8556,6 +8560,10 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+CapacityReason = Literal["max_spawn", "max_in_progress"]
+DispatchHealthReason = Literal["tick_unavailable", "launch_failed", "unassigned", "unknown"]
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -8627,6 +8635,56 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    capacity_capped: Optional[CapacityReason] = None
+    """Tick-level concurrency cap that prevented candidate enumeration."""
+    candidates_examined: int = 0
+    """Ready/review rows that entered dispatch disposition handling."""
+    capacity_deferred: int = 0
+    """Rows left unexamined because the shared/lane spawn budget was exhausted."""
+    claim_contended: int = 0
+    """Rows whose atomic ready/review claim lost a concurrent race."""
+    spawn_failure_count: int = 0
+    spawn_failed: list[tuple[str, str]] = field(default_factory=list)
+    """First three redacted launch/workspace errors; total is counted separately."""
+
+
+def _record_dispatch_launch_failure(
+    result: DispatchResult, task_id: str, error: str,
+) -> None:
+    """Record a launch failure without coupling telemetry to breaker state."""
+    result.spawn_failure_count += 1
+    if len(result.spawn_failed) < 3:
+        safe_error = str(redact_review_value(error))[:512]
+        result.spawn_failed.append((task_id, safe_error))
+
+
+def dispatch_health_reason(
+    result: Optional[DispatchResult],
+) -> Optional[DispatchHealthReason]:
+    """Classify one dispatch result without querying board state again.
+
+    Launch failures win over successful spawns and legitimate deferrals so a
+    partial-success tick cannot hide a broken worker path. Every examined row
+    must have a disposition; an accounting gap is an actionable code-path bug.
+    """
+    if result is None:
+        return "tick_unavailable"
+    if result.spawn_failure_count or result.spawn_failed:
+        return "launch_failed"
+    accounted = (
+        len(result.spawned)
+        + len(result.skipped_unassigned)
+        + len(result.skipped_nonspawnable)
+        + len(result.skipped_per_profile_capped)
+        + len(result.respawn_guarded)
+        + result.claim_contended
+        + result.spawn_failure_count
+    )
+    if result.candidates_examined > accounted:
+        return "unknown"
+    if result.skipped_unassigned:
+        return "unassigned"
+    return None
 
 
 # Bounded legacy registry of explicit raw worker exits, consulted by
@@ -10889,6 +10947,7 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_capped = "max_spawn"
             return result
         spawn_budget = max_spawn - running_count
 
@@ -10905,6 +10964,7 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_capped = "max_in_progress"
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -11012,9 +11072,11 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    for row in ready_rows:
+    for index, row in enumerate(ready_rows):
         if ready_budget is not None and spawned >= ready_budget:
+            result.capacity_deferred += len(ready_rows) - index
             break
+        result.candidates_examined += 1
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -11105,9 +11167,8 @@ def _dispatch_once_locked(
         # persistent auth/quota blocker for operator intervention.
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason == "blocker_workspace":
-            if dry_run:
-                result.respawn_guarded.append((row["id"], guard_reason))
-            elif _trip_workspace_respawn_guard(
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run and _trip_workspace_respawn_guard(
                 conn,
                 row["id"],
                 failure_limit=failure_limit,
@@ -11141,6 +11202,7 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            result.claim_contended += 1
             continue
         try:
             resolved_branch_name = None
@@ -11149,6 +11211,7 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            _record_dispatch_launch_failure(result, claimed.id, f"workspace: {exc}")
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -11201,6 +11264,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            _record_dispatch_launch_failure(result, claimed.id, str(exc))
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -11228,9 +11292,11 @@ def _dispatch_once_locked(
     # ready backlog. The review loop itself still checks the FULL shared
     # ``spawn_budget`` — the reservation caps the ready lane, it does not
     # grant the review lane extra capacity.
-    for row in review_rows:
+    for index, row in enumerate(review_rows):
         if spawn_budget is not None and spawned >= spawn_budget:
+            result.capacity_deferred += len(review_rows) - index
             break
+        result.candidates_examined += 1
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -11250,9 +11316,8 @@ def _dispatch_once_locked(
                 continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason == "blocker_workspace":
-            if dry_run:
-                result.respawn_guarded.append((row["id"], guard_reason))
-            elif _trip_workspace_respawn_guard(
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run and _trip_workspace_respawn_guard(
                 conn,
                 row["id"],
                 failure_limit=failure_limit,
@@ -11279,6 +11344,7 @@ def _dispatch_once_locked(
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            result.claim_contended += 1
             continue
         try:
             resolved_branch_name = None
@@ -11287,6 +11353,7 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            _record_dispatch_launch_failure(result, claimed.id, f"workspace: {exc}")
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -11332,6 +11399,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            _record_dispatch_launch_failure(result, claimed.id, str(exc))
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,

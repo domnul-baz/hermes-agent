@@ -58,6 +58,45 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _update_dispatch_health(
+    state: dict[str, dict[str, Any]],
+    slug: str,
+    reason: Optional[str],
+    *,
+    now: float,
+    window: int = 6,
+    warn_interval: float = 300.0,
+) -> Optional[str]:
+    """Update per-board health and return a bounded warning when due.
+
+    ``None`` is a healthy or legitimately deferred tick. Launch failures warn
+    on their first tick (and each affected tick until the breaker resolves the
+    episode); other actionable reasons require a sustained window and are rate
+    limited. State is isolated by board, so one healthy board cannot mask
+    another board's failure.
+    """
+    if reason is None:
+        state.pop(slug, None)
+        return None
+    entry = state.get(slug)
+    if entry is None or entry.get("reason") != reason:
+        entry = {"reason": reason, "bad_ticks": 1, "last_warn_at": None}
+        state[slug] = entry
+    else:
+        entry["bad_ticks"] = int(entry.get("bad_ticks", 0)) + 1
+    if reason != "launch_failed" and entry["bad_ticks"] < max(1, window):
+        return None
+    last_warn_at = entry.get("last_warn_at")
+    if reason != "launch_failed" and last_warn_at is not None:
+        if now - float(last_warn_at) < warn_interval:
+            return None
+    entry["last_warn_at"] = now
+    return (
+        f"kanban dispatcher [{slug}] unhealthy: reason={reason} "
+        f"consecutive_ticks={entry['bad_ticks']}"
+    )
+
+
 def _kanban_dispatch_allowed() -> bool:
     """Return False while the global emergency stop (`hermes pause`) is engaged.
 
@@ -1414,12 +1453,10 @@ class GatewayKanbanWatchersMixin:
         # subscriptions etc.). Matches the notifier watcher's delay.
         await asyncio.sleep(5)
 
-        # Health telemetry mirrored from `_cmd_daemon`: warn when ready
-        # queue is non-empty but spawns are 0 for N consecutive ticks —
-        # usually means broken PATH, missing venv, or credential loss.
-        HEALTH_WINDOW = 6
-        bad_ticks = 0
-        last_warn_at = 0
+        # Per-board, result-derived health. The dispatch result is the only
+        # oracle: a second queue probe cannot model caps, memory, locks, or
+        # breaker transitions and previously inverted signal and noise.
+        dispatch_health: dict[str, dict[str, Any]] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1558,48 +1595,6 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
-
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
-            """
-            # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                conn = None
-                try:
-                    conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-            return False
-
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -1718,8 +1713,7 @@ class GatewayKanbanWatchersMixin:
                 # and dispatch entirely — no new workers while paused. Running
                 # workers finish naturally; zombie reaping above still runs.
                 if not _kanban_dispatch_allowed():
-                    ready_pending = False
-                    bad_ticks = 0
+                    dispatch_health.clear()
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
                     # flipping kanban.auto_decompose=false to STOP runaway fan-out
@@ -1728,10 +1722,11 @@ class GatewayKanbanWatchersMixin:
                     if _ad_enabled:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
                     results = await _to_thread_process_service(_tick_once)
-                    any_spawned = False
+                    active_slugs: set[str] = set()
+                    health_now = time.monotonic()
                     for slug, res in (results or []):
+                        active_slugs.add(slug)
                         if res is not None and getattr(res, "spawned", None):
-                            any_spawned = True
                             # Quiet by default — only log when something actually
                             # happened, so an idle gateway stays silent.
                             logger.info(
@@ -1745,23 +1740,22 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
-                    # Health telemetry (aggregate across boards)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
-                    if ready_pending and not any_spawned:
-                        bad_ticks += 1
-                    else:
-                        bad_ticks = 0
-                if bad_ticks >= HEALTH_WINDOW:
-                    now = int(time.time())
-                    if now - last_warn_at >= 300:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
+                        reason = _kb.dispatch_health_reason(res)
+                        warning = _update_dispatch_health(
+                            dispatch_health, slug, reason, now=health_now,
                         )
-                        last_warn_at = now
+                        if warning is not None:
+                            if reason == "launch_failed" and res is not None:
+                                logger.warning(
+                                    "%s failure_count=%d samples=%r",
+                                    warning,
+                                    getattr(res, "spawn_failure_count", 0),
+                                    getattr(res, "spawn_failed", [])[:3],
+                                )
+                            else:
+                                logger.warning("%s", warning)
+                    for stale_slug in set(dispatch_health) - active_slugs:
+                        dispatch_health.pop(stale_slug, None)
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
