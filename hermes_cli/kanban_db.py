@@ -5803,39 +5803,160 @@ def _verify_created_cards(
 # ``_new_task_id`` below. Kept permissive on length for forward compat:
 # accept 8+ hex chars after the ``t_`` prefix.
 _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
+_MAX_PROSE_TASK_REFERENCES = 256
+_MAX_PROSE_QUALIFIED_BOARDS = 32
+_PROSE_REFERENCE_TOKEN_DELIMITERS = frozenset(" \t\r\n()[]{}<>\"'`*,;!?|")
 
 
-def _scan_prose_for_phantom_ids(
+def _parse_prose_task_references(text: str) -> list[dict[str, Any]]:
+    """Parse bounded task references without degrading malformed qualifiers.
+
+    A task ID immediately preceded by ``:`` is irrevocably a qualified-or-
+    malformed reference.  In particular, do not use an optional qualifier
+    regex here: its backtracking would turn ``APR:t_deadbeef`` into the bare
+    ``t_deadbeef`` and accidentally query the current board.
+    """
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    parsed_count = 0
+    for match in _TASK_ID_PROSE_RE.finditer(text):
+        task_id = match.group(0)
+        start = match.start()
+        reference_type = "bare"
+        board: Optional[str] = None
+        reference = task_id
+        if start and text[start - 1] == ":":
+            token_start = start - 1
+            while token_start and text[token_start - 1] not in _PROSE_REFERENCE_TOKEN_DELIMITERS:
+                token_start -= 1
+            qualifier = text[token_start:start - 1]
+            reference = text[token_start:match.end()]
+            if _BOARD_SLUG_RE.fullmatch(qualifier):
+                reference_type = "qualified"
+                board = qualifier
+            else:
+                reference_type = "malformed"
+        parsed_count += 1
+        if parsed_count > _MAX_PROSE_TASK_REFERENCES:
+            refs.append({
+                "reference": reference,
+                "task_id": task_id,
+                "board": board,
+                "reference_type": reference_type,
+                "status": "limit_exceeded",
+            })
+            break
+        if reference in seen:
+            continue
+        seen.add(reference)
+        refs.append({
+            "reference": reference,
+            "task_id": task_id,
+            "board": board,
+            "reference_type": reference_type,
+            "status": None,
+        })
+    return refs
+
+
+def _qualified_task_statuses(board: str, task_ids: Iterable[str]) -> dict[str, str]:
+    """Resolve task IDs on one explicit board through one read-only query."""
+    unique_task_ids = list(dict.fromkeys(task_ids))
+    if not unique_task_ids:
+        return {}
+    try:
+        # Board metadata can disappear between parsing and lookup. Keep this
+        # inside the advisory scan's failure boundary so completion is never
+        # interrupted by an OSError or path race.
+        if not board_exists(board):
+            return {task_id: "missing_board" for task_id in unique_task_ids}
+        path = kanban_db_path(board=board).expanduser()
+        if not path.is_file():
+            return {task_id: "lookup_error" for task_id in unique_task_ids}
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            placeholders = ",".join(["?"] * len(unique_task_ids))
+            rows = conn.execute(
+                f"SELECT id FROM tasks WHERE id IN ({placeholders})",
+                tuple(unique_task_ids),
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return {task_id: "lookup_error" for task_id in unique_task_ids}
+    found = {row[0] for row in rows}
+    return {
+        task_id: "resolved" if task_id in found else "missing_task"
+        for task_id in unique_task_ids
+    }
+
+
+def _scan_prose_for_phantom_references(
     conn: sqlite3.Connection,
     text: str,
-) -> list[str]:
-    """Regex-scan free-form text for ``t_<hex>`` references; return the
-    ones that don't exist in ``tasks``.
+) -> list[dict[str, Any]]:
+    """Return typed evidence for unresolved prose task references.
 
-    Used as a non-blocking advisory check on completion summaries. An
-    empty return means "no suspicious references found" — either the
-    text had no IDs at all, or every ID it mentioned resolves to a real
-    task. Duplicates are deduped.
+    Bare IDs are deliberately resolved only through ``conn``. Qualified IDs
+    use a separately opened, read-only connection to exactly their named board.
     """
     if not text:
         return []
-    matches = _TASK_ID_PROSE_RE.findall(text)
-    if not matches:
+    refs = _parse_prose_task_references(text)
+    if not refs:
         return []
-    # Dedupe preserving order.
-    seen: set[str] = set()
-    unique: list[str] = []
-    for m in matches:
-        if m not in seen:
-            seen.add(m)
-            unique.append(m)
-    placeholders = ",".join(["?"] * len(unique))
-    rows = conn.execute(
-        f"SELECT id FROM tasks WHERE id IN ({placeholders})",
-        tuple(unique),
-    ).fetchall()
-    existing = {r["id"] for r in rows}
-    return [m for m in unique if m not in existing]
+    bare_ids = [
+        ref["task_id"] for ref in refs
+        if ref["reference_type"] == "bare" and ref["status"] is None
+    ]
+    existing_bare: set[str] = set()
+    if bare_ids:
+        placeholders = ",".join(["?"] * len(bare_ids))
+        rows = conn.execute(
+            f"SELECT id FROM tasks WHERE id IN ({placeholders})", tuple(bare_ids)
+        ).fetchall()
+        existing_bare = {row["id"] for row in rows}
+
+    qualified_boards: set[str] = set()
+    qualified_refs_by_board: dict[str, list[dict[str, Any]]] = {}
+    for ref in refs:
+        if ref["reference_type"] != "qualified":
+            continue
+        board = ref["board"]
+        assert board is not None
+        if board not in qualified_boards:
+            if len(qualified_boards) >= _MAX_PROSE_QUALIFIED_BOARDS:
+                ref["status"] = "limit_exceeded"
+                continue
+            qualified_boards.add(board)
+            qualified_refs_by_board[board] = []
+        qualified_refs_by_board[board].append(ref)
+
+    qualified_statuses: dict[str, dict[str, str]] = {}
+    for board, board_refs in qualified_refs_by_board.items():
+        qualified_statuses[board] = _qualified_task_statuses(
+            board, (ref["task_id"] for ref in board_refs)
+        )
+
+    evidence: list[dict[str, Any]] = []
+    for ref in refs:
+        if ref["status"] == "limit_exceeded":
+            evidence.append(ref)
+        elif ref["reference_type"] == "malformed":
+            ref["status"] = "malformed_reference"
+            evidence.append(ref)
+        elif ref["reference_type"] == "bare":
+            if ref["task_id"] not in existing_bare:
+                ref["status"] = "missing_task"
+                evidence.append(ref)
+        else:
+            board = ref["board"]
+            assert board is not None
+            status = qualified_statuses[board][ref["task_id"]]
+            if status != "resolved":
+                ref["status"] = status
+                evidence.append(ref)
+    return evidence
 
 
 class HallucinatedCardsError(ValueError):
@@ -6069,17 +6190,25 @@ def complete_task(
     # time we emit the warning.
     scan_text = " ".join(filter(None, [summary, result]))
     if scan_text:
-        phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
-        # Drop any phantom refs that were already flagged as verified
-        # above (shouldn't happen — verified means they exist — but
-        # belt-and-suspenders).
-        phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
-        if phantom_refs:
+        reference_evidence = _scan_prose_for_phantom_references(conn, scan_text)
+        # ``created_cards`` verification is scoped to this board, so it can
+        # suppress only a matching bare reference. A same-named qualified
+        # reference intentionally remains an independent cross-board audit.
+        verified_current_board = set(verified_cards)
+        reference_evidence = [
+            item for item in reference_evidence
+            if not (
+                item["reference_type"] == "bare"
+                and item["task_id"] in verified_current_board
+            )
+        ]
+        if reference_evidence:
             with write_txn(conn):
                 _append_event(
                     conn, task_id, "suspected_hallucinated_references",
                     {
-                        "phantom_refs": phantom_refs,
+                        "phantom_refs": [item["reference"] for item in reference_evidence],
+                        "reference_evidence": reference_evidence,
                         "source": "completion_summary",
                     },
                     run_id=run_id,
